@@ -1,0 +1,15 @@
+---
+description: Database schema, migrations, and TiDB SQL conventions
+globs: database/**/*,api/index.ts
+alwaysApply: false
+---
+
+# Database & Migrations
+
+- Source of truth for structure while coding: **`database/schema.sql`**
+- Schema changes: create `database/migrations/YYYYMMDD_HHMMSS_description.sql` (TiDB Cloud Serverless / MySQL 8.0 compatible)
+- After apply: update `database/schema.sql` to match
+- Apply with `npm run db:migrate` (tracks `schema_migrations`)
+- Credentials: `.env` (`DB_HOST`, `DB_PORT`, `DB_USER`, `DB_PASSWORD`, `DB_NAME`, `DB_SSL`)
+- Learners, staff, and company buyers keep separate login-code and session tables
+- Map DB errors to friendly API responses (409 duplicate, 400 FK) — never leak raw MySQL/TiDB messages

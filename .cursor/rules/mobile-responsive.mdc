@@ -1,0 +1,39 @@
+---
+description: Mandatory mobile responsiveness — no horizontal page scroll
+globs: app/**/*.{ts,tsx,css}
+alwaysApply: true
+---
+
+# Mobile Responsiveness (mandatory)
+
+Every UI change — client, admin, marketing, auth, modals — must work on ~375px and up. **Page-level horizontal scrolling is forbidden.**
+
+## Hard rules
+- Layout must fit the viewport width; only **vertical** page scroll
+- Contained horizontal scroll is OK only inside tables/carousels (`.table-scroll`, overflow-x-auto on a bounded child) — never on `html`/`body`/`#root`
+- Flex/grid children that can grow: always `min-w-0` (and often `max-w-full`) on the scroll column
+- Prefer responsive stacks: `grid-cols-1 sm:grid-cols-2`, wrap toolbars with `flex-wrap gap-*`
+- Wide tables: wrap in `.table-scroll` + provide `DataGrid` `mobileCard` for `< sm`
+- Admin chrome: desktop sidebar at `lg+`; below `lg` use the drawer/top bar — never a permanent wide sidebar on phones
+- Long text/URLs/HTML: `break-words` / `break-all` on links; rich content gets `overflow-x-auto` + `min-w-0`
+- No fixed widths wider than the viewport without `max-w-full` / `min(..., 100%)`
+- Avoid negative horizontal margins (`-mx-*`) that escape padded cards on small screens
+
+## Validate before finishing
+1. Mentally (or in browser) check **375px** and **768px**
+2. Confirm no document `overflow-x` / sideways drag
+3. Tap targets usable; primary actions not clipped off-screen
+
+```tsx
+// ❌ BAD — forces page-wide scroll
+<div className="flex">
+  <aside className="w-[272px] shrink-0" />
+  <main className="flex-1">{/* wide table */}</main>
+</div>
+
+// ✅ GOOD
+<div className="flex max-w-[100vw] overflow-hidden">
+  <aside className="hidden lg:flex w-[272px] shrink-0" />
+  <main className="min-w-0 max-w-full flex-1 overflow-x-hidden">{children}</main>
+</div>
+```

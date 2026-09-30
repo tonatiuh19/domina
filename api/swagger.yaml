@@ -1,0 +1,151 @@
+openapi: 3.0.3
+info:
+  title: DOMINA API
+  version: 0.1.0
+  description: Single Vercel serverless monolith. Learners and staff use separate session tables. Company buyers are staff with role=company.
+servers:
+  - url: /api
+paths:
+  /health:
+    get:
+      summary: Health check
+  /catalog/courses:
+    get:
+      summary: Published courses with upcoming editions
+  /catalog/courses/{slug}:
+    get:
+      summary: One published course
+  /auth/user/request-otp:
+    post:
+      summary: Email a learner login code. Live mail is skipped under VITEST and for @example.test.
+  /auth/user/verify-otp:
+    post:
+      summary: Create a user session
+  /auth/user/logout:
+    post:
+      summary: Revoke the user session
+  /auth/user/me:
+    get:
+      summary: Current learner
+    patch:
+      summary: Update learner profile including optional preferred language
+  /auth/user/language:
+    put:
+      summary: Persist learner UI language preference (es|en)
+  /auth/admin/check:
+    post:
+      summary: Whether a staff or company email already exists
+  /auth/admin/request-otp:
+    post:
+      summary: Email a portal login code. Optional companyName registers a company role account.
+  /auth/admin/verify-otp:
+    post:
+      summary: Create a staff session
+  /auth/admin/me:
+    get:
+      summary: Current staff member including company role fields
+  /auth/admin/language:
+    put:
+      summary: Persist staff UI language preference (es|en)
+  /auth/admin/logout:
+    post:
+      summary: Revoke the staff session
+  /portal/enrollments:
+    get:
+      summary: Learner seats
+    post:
+      summary: Reserve a seat
+  /portal/enrollments/{id}:
+    get:
+      summary: Single learner seat by id (refresh-safe pay page)
+  /portal/checkout:
+    post:
+      summary: Stripe Checkout elements client secret with card + OXXO; return_url lands on /cuenta/exito
+  /portal/checkout/confirm:
+    post:
+      summary: Mark a seat paid after Stripe redirects back, when no webhook is configured
+  /site/pages/{slug}:
+    get:
+      summary: Public legal page markdown (terminos, privacidad) localized by lang query
+  /admin/pages:
+    get:
+      summary: List legal pages for owners and coordinators
+  /admin/pages/{slug}:
+    get:
+      summary: Load bilingual markdown legal page for editing
+    patch:
+      summary: Save bilingual markdown legal page
+  /portal/feedback:
+    post:
+      summary: Rate a completed seat
+  /admin/company/requests:
+    get:
+      summary: Company role — own training requests
+    post:
+      summary: Company role — ask for a private edition
+  /admin/dashboard:
+    get:
+      summary: Occupancy, revenue, and open requests (ops roles)
+  /admin/courses:
+    get:
+      summary: Paginated courses grid (search, sort, page, limit)
+    post:
+      summary: Create a course with full content fields; then upload cover/gallery via CDN endpoints
+  /admin/courses/slug-availability:
+    get:
+      summary: Check whether a course slug is free and return a unique suggestion
+  /admin/catalog/{kind}:
+    get:
+      summary: List catalog options (categories|levels|audiences|cities|venues); includeInactive=1 shows deactivated
+    post:
+      summary: Create a catalog option (owner/coordinator)
+  /admin/catalog/{kind}/{id}:
+    patch:
+      summary: Update or soft-deactivate a catalog option
+  /admin/courses/{id}:
+    get:
+      summary: Course, editions, and edition-scoped participants
+    patch:
+      summary: Update course operations fields
+  /admin/courses/{id}/cover-image:
+    post:
+      summary: Upload a course cover image to Disrupting Labs CDN
+  /admin/courses/{id}/gallery:
+    post:
+      summary: Add a gallery image for a course
+  /admin/courses/{id}/gallery/{imageId}:
+    patch:
+      summary: Update a gallery image caption
+    delete:
+      summary: Remove a gallery image
+  /admin/courses/{id}/editions:
+    post:
+      summary: Schedule an edition
+  /admin/editions:
+    get:
+      summary: Open editions for manual enrollment (presale/confirmed)
+  /admin/editions/{id}:
+    patch:
+      summary: Update an edition
+  /admin/enrollments/{id}:
+    patch:
+      summary: Attendance or offline payment method
+  /admin/participants:
+    get:
+      summary: Paginated participants across courses (search, sort, filters)
+    post:
+      summary: Manually enroll a learner (create user if needed) and mark paid
+  /admin/payments:
+    get:
+      summary: Paginated payment ledger
+  /admin/team:
+    get:
+      summary: Paginated staff roster including company role accounts
+    post:
+      summary: Invite staff or a company contact
+  /admin/team/{id}:
+    patch:
+      summary: Change staff role or status
+  /admin/requests:
+    get:
+      summary: All company requests for ops

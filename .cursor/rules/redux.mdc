@@ -1,0 +1,14 @@
+---
+description: Redux data fetching — never call APIs from components
+globs: app/**/*.{ts,tsx}
+alwaysApply: false
+---
+
+# Redux & Data Fetching
+
+**ALL data fetching in Redux slices via `createAsyncThunk` + axios. NEVER in components.**
+
+- Hooks: `useAppDispatch` / `useAppSelector` from `app/store/hooks.ts`
+- Axios only from slices — never raw `fetch` for app APIs
+- Learner, staff tokens stay in separate slices and localStorage keys. Company buyers use the staff token with `role=company`.
+- Surface errors with `formatAxiosError` from `app/lib/api.ts` in `rejectWithValue`

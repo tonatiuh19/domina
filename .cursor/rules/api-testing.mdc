@@ -1,0 +1,34 @@
+---
+description: Mandatory API/integration test coverage — happy paths + edge cases
+alwaysApply: true
+---
+
+# API & integration testing (mandatory)
+
+Every API route, authz rule, payment path, and data mutation must stay **stable and fully tested** — including edge scenarios. Deploy (`npm run deploy:prod`) runs `npm test`; incomplete coverage is a blocker.
+
+## When you add or change API behavior
+1. Update or add tests in `api/**/*.test.ts` in the **same change**
+2. Cover **happy path + edges**: 400/401/403/404/409, authz roles, duplicates, capacity, inactive FKs, idempotency
+3. Use `@example.test` fixtures only; never live Resend/Stripe under `VITEST=true`
+4. Clean up with `cleanupIntegrationTestFixtures(pool, { runId })` from `api/testDbCleanup.ts`
+5. Prefer helpers in `api/testHarness.ts` (OTP login, catalog edition) over copy-paste
+
+## Required coverage areas
+- Auth (user + staff + company): check, OTP request/verify, wrong/expired codes, logout, language, session isolation
+- Portal: enroll (resume / already paid / full), checkout 503 under VITEST, simulate pay, `markEnrollmentPaid` idempotency, feedback
+- Stripe webhook: unconfigured → 503; fulfillment via exported `markEnrollmentPaid`
+- Admin authz matrix: owner / coordinator / instructor / finance / company vs read/write
+- Catalog CRUD (all kinds), courses/editions/images, participants, team, payments lists, company requests, legal pages
+- Friendly DB errors: `isDuplicateKeyError` / `mapFriendlyDbError`
+
+## Do not
+- Ship route changes with only UI smoke tests
+- Call live Stripe or Resend in vitest
+- Leave `@example.test` rows without cleanup (suite `afterAll` + `npm run test:cleanup-fixtures`)
+
+## Verify
+```bash
+npm test
+npm run test:cleanup-fixtures
+```

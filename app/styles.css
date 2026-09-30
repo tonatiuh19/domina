@@ -1,0 +1,129 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  --background: 42 35% 97%;
+  --foreground: 160 19% 10%;
+  --card: 40 45% 99%;
+  --card-foreground: 160 19% 10%;
+  --primary: 158 53% 16%;
+  --primary-foreground: 42 35% 97%;
+  --secondary: 42 24% 92%;
+  --secondary-foreground: 160 19% 10%;
+  --muted: 42 24% 92%;
+  --muted-foreground: 155 8% 38%;
+  --accent: 73 86% 66%;
+  --accent-foreground: 158 53% 12%;
+  --destructive: 8 72% 46%;
+  --destructive-foreground: 0 0% 98%;
+  --border: 40 16% 84%;
+  --input: 40 16% 84%;
+  --ring: 158 53% 24%;
+  --radius: 0.8rem;
+}
+
+* {
+  border-color: hsl(var(--border));
+}
+
+html {
+  scroll-behavior: smooth;
+  overflow-x: clip;
+  max-width: 100%;
+}
+
+body {
+  margin: 0;
+  min-height: 100vh;
+  max-width: 100%;
+  overflow-x: clip;
+  background: hsl(var(--background));
+  color: hsl(var(--foreground));
+  font-family: Manrope, sans-serif;
+}
+
+#root {
+  max-width: 100%;
+  min-width: 0;
+  overflow-x: clip;
+}
+
+.font-display,
+.portal-shell :is(h1, h2, h3) {
+  font-family: Outfit, Manrope, sans-serif;
+}
+
+::selection {
+  background: #d6f25c;
+  color: #12352b;
+}
+
+@keyframes domina-shimmer {
+  0% {
+    background-position: 100% 0;
+  }
+  100% {
+    background-position: -100% 0;
+  }
+}
+
+.domina-skeleton {
+  background-image: linear-gradient(
+    105deg,
+    #e7e2d6 0%,
+    #e7e2d6 38%,
+    #f4f0e4 50%,
+    #dce8c4 58%,
+    #e7e2d6 68%,
+    #e7e2d6 100%
+  );
+  background-size: 220% 100%;
+  animation: domina-shimmer 1.35s ease-in-out infinite;
+  border-radius: 0.5rem;
+}
+
+.table-scroll {
+  max-width: 100%;
+  min-width: 0;
+  overflow-x: auto;
+  -webkit-overflow-scrolling: touch;
+  overscroll-behavior-x: contain;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .domina-skeleton {
+    animation: none;
+    background: #e7e2d6;
+  }
+}
+
+@keyframes domina-kenburns {
+  from {
+    transform: scale(1.05) translate3d(0, 0, 0);
+  }
+  to {
+    transform: scale(1.14) translate3d(-1.5%, -1%, 0);
+  }
+}
+
+@keyframes domina-fade-up {
+  from {
+    opacity: 0;
+    transform: translate3d(0, 10px, 0);
+  }
+  to {
+    opacity: 1;
+    transform: translate3d(0, 0, 0);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .motion-safe\:animate-\[domina-kenburns_28s_ease-in-out_infinite_alternate\] {
+    animation: none !important;
+  }
+  .motion-safe\:animate-\[domina-fade-up_0\.4s_ease-out\],
+  .motion-safe\:animate-\[domina-fade-up_0\.45s_ease-out\] {
+    animation: none !important;
+  }
+}

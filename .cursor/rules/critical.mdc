@@ -1,0 +1,22 @@
+---
+description: Critical DOMINA project rules — always apply
+alwaysApply: true
+---
+
+# Critical Rules (NO EXCEPTIONS)
+
+- **npm only** — never pnpm or yarn
+- **Schema first**: always check `database/schema.sql` before any SQL; never assume column names
+- **Never edit `database/schema.sql` directly for schema changes** — write a migration in `database/migrations/` first, apply it, then update `schema.sql` to match
+- **API monolith**: all required API logic stays **inline** in `api/index.ts` (Vercel serverless). Do **not** runtime-import from `shared/` in the API — `import type` only. Shared runtime modules break prod with `ERR_MODULE_NOT_FOUND`
+- **Redux only for data**: never axios/fetch in components; use `createAsyncThunk` in slices; components only dispatch + select
+- **Fix root causes** — never patch around type errors or bugs
+- **No breaking changes**
+- **API + swagger**: any change to `api/index.ts` routes/behavior → update `api/swagger.yaml`
+- **Design system**: relevant UI changes → update `DESIGN.md` when applicable
+- **i18n**: new user-visible strings → both `app/locales/en/translation.json` and `es/translation.json`, use `t('key')` — never hardcode UI copy
+- **Separate identities**: learners (`users` / `user_sessions`) and staff (`admins` / `admin_sessions`) never share a session table. Company buyers are staff with `role=company` and `admins.company_id`
+- **Tests**: `VITEST=true` and `@example.test` addresses must never send Resend mail or hit live Stripe. `npm run test:cleanup-fixtures` removes those rows after the suite and before deploy. **API changes require full integration coverage (happy + edge)** — see `.cursor/rules/api-testing.mdc`
+- Prefer reusable components/utilities when it avoids debt
+- **Mobile first**: every UI change must be fully responsive; **no page-level horizontal scrolling** on any viewport — see `.cursor/rules/mobile-responsive.mdc`
+- Frontend: clean UX; UI logs via `app/utils/logger.ts`
