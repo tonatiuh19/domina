@@ -12,6 +12,8 @@ import { Label } from "@/components/ui/label";
 import { Textarea } from "@/components/ui/textarea";
 import { AccountHomeSkeleton, AccountPaySkeleton } from "@/components/ui/skeleton";
 import { PaymentCelebration } from "@/components/account/PaymentCelebration";
+import { OxxoVoucherModal } from "@/components/account/OxxoVoucherModal";
+import { TransferInstructions } from "@/components/account/TransferInstructions";
 import { StarRating } from "@/components/account/StarRating";
 import { ClientShell } from "@/pages/client/ClientLayout";
 import { formatMoney } from "@/lib/api";
@@ -26,9 +28,14 @@ import {
   confirmCheckout,
   fetchEnrollment,
   fetchEnrollments,
+  applyCoupon,
+  confirmFreeCheckout,
+  fetchOxxoVoucher,
+  removeCoupon,
   fetchRecommendations,
   sendFeedback,
   startCheckout,
+  startTransfer,
 } from "@/store/slices/portalSlice";
 
 export function AccountHome() {
@@ -144,7 +151,11 @@ export function AccountHome() {
                 </p>
                 <p className="mt-2 text-sm text-paper/55">
                   {t("account.method")}:{" "}
-                  {next.paymentMethod === "oxxo" ? t("pay.oxxo") : next.paymentMethod || "—"}
+                  {next.paymentMethod === "oxxo"
+                    ? t("pay.oxxo")
+                    : next.paymentMethod === "transfer"
+                      ? t("pay.transfer")
+                      : next.paymentMethod || "—"}
                   {next.cardLast4 ? ` ···· ${next.cardLast4}` : ""}
                 </p>
                 {next.status === "pending" && next.paymentMethod !== "oxxo" ? (
@@ -152,7 +163,7 @@ export function AccountHome() {
                     to={`/cuenta/pagar/${next.id}`}
                     className="mt-5 inline-flex rounded-xl bg-citrus px-4 py-2.5 text-sm font-semibold text-ink transition hover:brightness-105"
                   >
-                    {t("account.pay")}
+                    {next.paymentMethod === "transfer" ? t("pay.transferView") : t("account.pay")}
                   </Link>
                 ) : next.status === "pending" && next.paymentMethod === "oxxo" ? (
                   <p className="mt-4 text-sm text-citrus">{t("pay.oxxoWaiting")}</p>
@@ -356,7 +367,7 @@ export function PaymentSuccess() {
       if (cancelled) return;
       if (confirmCheckout.fulfilled.match(result)) {
         if (result.payload.status === "pending_oxxo") {
-          navigate("/cuenta?oxxo=1", { replace: true });
+          navigate(`/cuenta/pagar/${result.payload.enrollmentId}`, { replace: true });
           return;
         }
         const enrollmentId = result.payload.enrollmentId || paidId;
@@ -505,13 +516,19 @@ function stripePublishableKey() {
 const stripePromise = stripePublishableKey() ? loadStripe(stripePublishableKey()) : null;
 
 function PayForm({
+  enrollmentId,
   submittingLabel,
   oxxoLabel,
+  onOxxoVoucher,
 }: {
+  enrollmentId: number;
   submittingLabel: string;
   oxxoLabel: string;
+  onOxxoVoucher?: (sessionId: string) => void;
 }) {
   const { t } = useTranslation();
+  const dispatch = useAppDispatch();
+  const navigate = useNavigate();
   const checkoutState = useCheckout();
   const [busy, setBusy] = useState(false);
   const [formError, setFormError] = useState<string | null>(null);
@@ -529,11 +546,35 @@ function PayForm({
         event.preventDefault();
         setBusy(true);
         setFormError(null);
-        const result = await checkout.confirm();
+        // if_required keeps OXXO on this page after the voucher modal closes;
+        // card still redirects when Stripe requires it.
+        const result = await checkout.confirm({ redirect: "if_required" });
         if (result.type === "error") {
           setFormError(result.error.message);
           setBusy(false);
+          return;
         }
+
+        const session = result.session;
+        const status = session.status;
+        if (status.type === "complete" && status.paymentStatus === "unpaid") {
+          const confirmed = await dispatch(confirmCheckout(session.id));
+          if (confirmCheckout.fulfilled.match(confirmed) && !confirmed.payload.voucher) {
+            await dispatch(fetchOxxoVoucher({ enrollmentId, sessionId: session.id }));
+          }
+          onOxxoVoucher?.(session.id);
+          // Mint a fresh open session so card/OXXO methods render again on this page.
+          await dispatch(startCheckout(enrollmentId));
+          setBusy(false);
+          return;
+        }
+
+        if (status.type === "complete" && status.paymentStatus === "paid") {
+          navigate(`/cuenta/exito?paid=${enrollmentId}&session_id=${session.id}`, { replace: true });
+          return;
+        }
+
+        setBusy(false);
       }}
     >
       <PaymentElement
@@ -595,13 +636,23 @@ function PayForm({
 export function PaySeat() {
   const { enrollmentId = "" } = useParams();
   const navigate = useNavigate();
+  const [searchParams, setSearchParams] = useSearchParams();
   const { t, i18n } = useTranslation();
   const dispatch = useAppDispatch();
   const token = useAppSelector((state) => state.userAuth.token);
   const user = useAppSelector((state) => state.userAuth.user);
-  const { clientSecret, error, errorCode, saving, loading, activeEnrollment, enrollments } = useAppSelector(
-    (state) => state.portal,
-  );
+  const {
+    clientSecret,
+    error,
+    errorCode,
+    saving,
+    loading,
+    activeEnrollment,
+    enrollments,
+    oxxoSessionId,
+    oxxoVoucher,
+    transfer,
+  } = useAppSelector((state) => state.portal);
   const id = Number(enrollmentId);
   const enrollment =
     activeEnrollment?.id === id ? activeEnrollment : enrollments.find((item) => item.id === id) || null;
@@ -612,6 +663,19 @@ export function PaySeat() {
     enrollment?.status === "no_show" ||
     errorCode === "seat_unavailable" ||
     errorCode === "not_found";
+  const oxxoPending = enrollment?.paymentMethod === "oxxo" && enrollment?.status === "pending";
+  const transferPending =
+    Boolean(transfer) || (enrollment?.paymentMethod === "transfer" && enrollment?.status === "pending");
+  const returnSessionId = searchParams.get("session_id");
+  const confirmingReturn = Boolean(returnSessionId);
+  const [oxxoVoucherHint, setOxxoVoucherHint] = useState(false);
+  const [oxxoModalOpen, setOxxoModalOpen] = useState(false);
+  const [couponInput, setCouponInput] = useState("");
+  const [payTab, setPayTab] = useState<"stripe" | "transfer">(
+    transferPending ? "transfer" : "stripe",
+  );
+  const isFreeWithCoupon =
+    Boolean(enrollment?.coupon || enrollment?.couponId) && Number(enrollment?.amountCents || 0) <= 0;
   const checkoutReady =
     activeEnrollment?.id === id &&
     (activeEnrollment.status === "pending" || activeEnrollment.status === "waitlist");
@@ -619,6 +683,9 @@ export function PaySeat() {
 
   useEffect(() => {
     dispatch(clearCheckout());
+    setOxxoVoucherHint(false);
+    setOxxoModalOpen(false);
+    setPayTab("stripe");
     return () => {
       dispatch(clearCheckout());
     };
@@ -635,15 +702,78 @@ export function PaySeat() {
   }, [dispatch, id, token]);
 
   useEffect(() => {
+    if (transferPending) setPayTab("transfer");
+  }, [transferPending]);
+
+  useEffect(() => {
     if (errorCode === "already_paid" || paidAlready) {
       navigate("/cuenta", { replace: true });
     }
   }, [errorCode, navigate, paidAlready]);
 
+  // Stripe return_url lands here with session_id (card paid or OXXO voucher closed).
   useEffect(() => {
-    if (!token || !publishable || !checkoutReady || paidAlready || seatUnavailable) return;
-    void dispatch(startCheckout(id));
-  }, [checkoutReady, dispatch, id, paidAlready, publishable, seatUnavailable, token]);
+    if (!token || !returnSessionId) return;
+    let cancelled = false;
+    void dispatch(confirmCheckout(returnSessionId)).then(async (result) => {
+      if (cancelled) return;
+      if (!confirmCheckout.fulfilled.match(result)) {
+        setSearchParams({}, { replace: true });
+        return;
+      }
+      const enrollmentIdPaid = result.payload.enrollmentId || id;
+      if (result.payload.status === "paid") {
+        navigate(`/cuenta/exito?paid=${enrollmentIdPaid}`, { replace: true });
+        return;
+      }
+      // OXXO voucher issued — open our branded modal (Stripe's modal already closed).
+      setOxxoVoucherHint(true);
+      setOxxoModalOpen(true);
+      setPayTab("stripe");
+      if (!result.payload.voucher) {
+        await dispatch(
+          fetchOxxoVoucher({
+            enrollmentId: enrollmentIdPaid,
+            sessionId: returnSessionId,
+          }),
+        );
+      }
+      setSearchParams({}, { replace: true });
+      await dispatch(startCheckout({ enrollmentId: enrollmentIdPaid, preferStripe: true }));
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [dispatch, id, navigate, returnSessionId, setSearchParams, token]);
+
+  useEffect(() => {
+    if (!token || !checkoutReady || paidAlready || seatUnavailable || confirmingReturn) {
+      return;
+    }
+    if (isFreeWithCoupon) return;
+    if (payTab === "transfer") {
+      if (!transfer) void dispatch(startTransfer(id));
+      return;
+    }
+    if (!publishable) return;
+    // Always (re)load an open Checkout Session so payment methods stay available —
+    // including after an OXXO voucher, when the API mints a fresh session.
+    if (clientSecret) return;
+    void dispatch(startCheckout({ enrollmentId: id, preferStripe: true }));
+  }, [
+    checkoutReady,
+    clientSecret,
+    confirmingReturn,
+    dispatch,
+    id,
+    isFreeWithCoupon,
+    paidAlready,
+    payTab,
+    publishable,
+    seatUnavailable,
+    token,
+    transfer,
+  ]);
 
   if (!token) return <Navigate to="/login" replace />;
   if (!Number.isFinite(id) || id < 1) return <Navigate to="/cuenta" replace />;
@@ -666,6 +796,32 @@ export function PaySeat() {
       : errorCode === "seat_unavailable"
         ? t("pay.unavailable")
         : error;
+
+  const showOxxoHint = oxxoVoucherHint || oxxoPending;
+  const showStripeTab = !isFreeWithCoupon && payTab === "stripe";
+  const showCheckoutForm = Boolean(
+    showStripeTab && clientSecret && publishable && stripePromise && !seatUnavailable,
+  );
+  const showTransferPanel =
+    !isFreeWithCoupon && payTab === "transfer" && transfer && !seatUnavailable;
+  const stripeLoading =
+    showStripeTab &&
+    !seatUnavailable &&
+    (confirmingReturn ||
+      saving ||
+      (loading && !enrollment) ||
+      (!clientSecret && publishable && !displayError));
+  const transferLoading =
+    !isFreeWithCoupon && payTab === "transfer" && !transfer && (saving || loading) && !displayError;
+
+  const selectTab = (tab: "stripe" | "transfer") => {
+    setPayTab(tab);
+    if (tab === "transfer") {
+      void dispatch(startTransfer(id));
+      return;
+    }
+    void dispatch(startCheckout({ enrollmentId: id, preferStripe: true }));
+  };
 
   return (
     <ClientShell metaTitle={t("pay.title")} metaDescription={t("pay.body")} metaPath={`/cuenta/pagar/${enrollmentId || ""}`}>
@@ -722,13 +878,23 @@ export function PaySeat() {
                       </div>
                     </dl>
                     <div className="flex items-end justify-between gap-4">
-                      <div>
+                      <div className="min-w-0">
                         <p className="text-[11px] font-semibold uppercase tracking-[0.16em] text-muted-foreground">
                           {t("pay.youPay")}
                         </p>
+                        {enrollment.discountCents && enrollment.discountCents > 0 && enrollment.listAmountCents != null ? (
+                          <p className="mt-1 text-sm text-muted-foreground line-through">
+                            {formatMoney(enrollment.listAmountCents, enrollment.currency)}
+                          </p>
+                        ) : null}
                         <p className="mt-1 font-display text-4xl font-semibold tracking-tight text-ink">
                           {formatMoney(enrollment.amountCents, enrollment.currency)}
                         </p>
+                        {enrollment.coupon?.code ? (
+                          <p className="mt-1 text-xs font-medium text-primary break-all">
+                            {t("pay.couponApplied", { code: enrollment.coupon.code })}
+                          </p>
+                        ) : null}
                       </div>
                       <p className="max-w-[12rem] text-right text-xs leading-5 text-muted-foreground">
                         {t("pay.includesSeat")}
@@ -742,6 +908,10 @@ export function PaySeat() {
                       <li className="flex gap-2">
                         <span className="mt-1.5 h-1.5 w-1.5 shrink-0 rounded-full bg-citrus" />
                         {t("pay.bulletOxxo")}
+                      </li>
+                      <li className="flex gap-2">
+                        <span className="mt-1.5 h-1.5 w-1.5 shrink-0 rounded-full bg-citrus" />
+                        {t("pay.bulletTransfer")}
                       </li>
                     </ul>
                   </div>
@@ -758,24 +928,173 @@ export function PaySeat() {
               )}
             </aside>
 
-            <div className="rounded-2xl border border-border bg-card/90 p-6 shadow-[0_20px_60px_rgba(18,35,27,0.06)] backdrop-blur sm:p-7">
+            <div className="min-w-0 max-w-full rounded-2xl border border-border bg-card/90 p-6 shadow-[0_20px_60px_rgba(18,35,27,0.06)] backdrop-blur sm:p-7">
               <p className="text-[11px] font-semibold uppercase tracking-[0.18em] text-primary">{t("pay.checkoutEyebrow")}</p>
               <h2 className="mt-2 font-display text-3xl font-semibold tracking-tight">{t("pay.title")}</h2>
               <p className="mt-2 text-sm leading-6 text-muted-foreground">{t("pay.body")}</p>
               {displayError ? <p className="mt-4 text-sm text-destructive">{displayError}</p> : null}
-              {!publishable ? <p className="mt-6 text-sm">{t("pay.missing")}</p> : null}
-              {!seatUnavailable && (saving || (loading && !enrollment) || (!clientSecret && publishable && !displayError)) ? (
+
+              {!seatUnavailable ? (
+                <div className="mt-6 space-y-3 rounded-xl border border-border bg-paper/70 p-4">
+                  <Label htmlFor="coupon-code">{t("pay.couponLabel")}</Label>
+                  {enrollment?.coupon?.code ? (
+                    <div className="flex flex-wrap items-center justify-between gap-2">
+                      <p className="min-w-0 text-sm font-semibold break-all">
+                        {enrollment.coupon.code}
+                        <span className="ml-2 font-normal text-muted-foreground">
+                          −{formatMoney(enrollment.discountCents || 0, enrollment.currency)}
+                        </span>
+                      </p>
+                      <Button
+                        type="button"
+                        variant="outline"
+                        size="sm"
+                        disabled={saving}
+                        onClick={() => {
+                          void dispatch(removeCoupon(id)).then((result) => {
+                            if (removeCoupon.fulfilled.match(result)) {
+                              setCouponInput("");
+                              setPayTab("stripe");
+                            }
+                          });
+                        }}
+                      >
+                        {t("pay.couponRemove")}
+                      </Button>
+                    </div>
+                  ) : (
+                    <div className="flex flex-col gap-2 sm:flex-row">
+                      <Input
+                        id="coupon-code"
+                        value={couponInput}
+                        onChange={(event) => setCouponInput(event.target.value.toUpperCase())}
+                        placeholder={t("pay.couponPlaceholder")}
+                        className="min-w-0 flex-1"
+                        autoComplete="off"
+                      />
+                      <Button
+                        type="button"
+                        className="sm:shrink-0"
+                        disabled={saving || couponInput.trim().length < 2}
+                        onClick={() => {
+                          void dispatch(applyCoupon({ enrollmentId: id, code: couponInput.trim() })).then(
+                            (result) => {
+                              if (applyCoupon.fulfilled.match(result) && result.payload.free) {
+                                setPayTab("stripe");
+                              }
+                            },
+                          );
+                        }}
+                      >
+                        {t("pay.couponApply")}
+                      </Button>
+                    </div>
+                  )}
+                </div>
+              ) : null}
+
+              {isFreeWithCoupon && !seatUnavailable ? (
+                <div className="mt-6 space-y-4 rounded-xl border border-citrus/40 bg-citrus/15 px-5 py-5">
+                  <div>
+                    <p className="font-semibold text-ink">{t("pay.couponFreeTitle")}</p>
+                    <p className="mt-1.5 text-sm leading-6 text-ink/80">{t("pay.couponFreeBody")}</p>
+                  </div>
+                  <Button
+                    type="button"
+                    className="h-12 w-full text-base"
+                    disabled={saving}
+                    onClick={() => {
+                      void dispatch(confirmFreeCheckout(id)).then((result) => {
+                        if (confirmFreeCheckout.fulfilled.match(result)) {
+                          navigate(`/cuenta/exito?paid=${id}`, { replace: true });
+                        }
+                      });
+                    }}
+                  >
+                    {saving ? t("common.loading") : t("pay.couponFreeConfirm")}
+                  </Button>
+                </div>
+              ) : null}
+
+              {!seatUnavailable && !isFreeWithCoupon ? (
+                <div
+                  className="mt-6 grid grid-cols-1 gap-2 sm:grid-cols-2"
+                  role="tablist"
+                  aria-label={t("pay.methodPicker")}
+                >
+                  {(
+                    [
+                      ["stripe", t("pay.methodStripe")],
+                      ["transfer", t("pay.transfer")],
+                    ] as const
+                  ).map(([key, label]) => (
+                    <button
+                      key={key}
+                      type="button"
+                      role="tab"
+                      aria-selected={payTab === key}
+                      className={`min-w-0 rounded-xl border px-3 py-3 text-sm font-semibold transition ${
+                        payTab === key
+                          ? "border-ink bg-ink text-paper"
+                          : "border-border bg-paper text-ink hover:border-ink/30"
+                      }`}
+                      onClick={() => selectTab(key)}
+                    >
+                      {label}
+                    </button>
+                  ))}
+                </div>
+              ) : null}
+
+              {showStripeTab && !publishable ? <p className="mt-6 text-sm">{t("pay.missing")}</p> : null}
+
+              {showOxxoHint && showStripeTab ? (
+                <div className="mt-6 rounded-xl border border-citrus/40 bg-citrus/15 px-5 py-4 text-sm leading-6 text-ink">
+                  <p className="font-semibold">{t("pay.oxxoStayTitle")}</p>
+                  <p className="mt-1.5 text-ink/80">{t("pay.oxxoStayBody")}</p>
+                  <p className="mt-2 text-xs text-ink/65">{t("pay.oxxoStayHint")}</p>
+                  <div className="mt-4 flex flex-wrap items-center gap-2">
+                    <Button
+                      type="button"
+                      className="h-10"
+                      onClick={() => {
+                        if (oxxoVoucher) {
+                          setOxxoModalOpen(true);
+                          return;
+                        }
+                        void dispatch(
+                          fetchOxxoVoucher({
+                            enrollmentId: id,
+                            ...(oxxoSessionId ? { sessionId: oxxoSessionId } : {}),
+                          }),
+                        ).then((result) => {
+                          if (fetchOxxoVoucher.fulfilled.match(result)) setOxxoModalOpen(true);
+                        });
+                      }}
+                    >
+                      {t("pay.oxxoOpenModal")}
+                    </Button>
+                  </div>
+                </div>
+              ) : null}
+
+              {stripeLoading || transferLoading ? (
                 <div className="mt-6">
                   <AccountPaySkeleton />
                 </div>
               ) : null}
-              {clientSecret && publishable && stripePromise && !seatUnavailable ? (
+
+              {showTransferPanel ? (
+                <TransferInstructions transfer={transfer!} onSwitchMethod={() => selectTab("stripe")} />
+              ) : null}
+
+              {showCheckoutForm ? (
                 <div className="mt-6">
                   <CheckoutProvider
-                    key={fullName || "pending-name"}
+                    key={clientSecret || fullName || "pending-name"}
                     stripe={stripePromise}
                     options={{
-                      clientSecret,
+                      clientSecret: clientSecret!,
                       ...(fullName
                         ? {
                             defaultValues: {
@@ -802,7 +1121,16 @@ export function PaySeat() {
                       },
                     }}
                   >
-                    <PayForm submittingLabel={t("pay.confirm")} oxxoLabel={t("pay.confirmOxxo")} />
+                    <PayForm
+                      enrollmentId={id}
+                      submittingLabel={t("pay.confirm")}
+                      oxxoLabel={t("pay.confirmOxxo")}
+                      onOxxoVoucher={() => {
+                        setOxxoVoucherHint(true);
+                        setOxxoModalOpen(true);
+                        setPayTab("stripe");
+                      }}
+                    />
                   </CheckoutProvider>
                 </div>
               ) : null}
@@ -810,6 +1138,13 @@ export function PaySeat() {
           </div>
         </div>
       </section>
+      <OxxoVoucherModal
+        open={oxxoModalOpen}
+        onClose={() => setOxxoModalOpen(false)}
+        enrollmentId={id}
+        sessionId={oxxoSessionId}
+        voucher={oxxoVoucher}
+      />
     </ClientShell>
   );
 }

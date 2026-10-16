@@ -4,13 +4,17 @@ import { useTranslation } from "react-i18next";
 import {
   BookOpen,
   Building2,
+  CalendarDays,
   ChevronLeft,
   ChevronRight,
   CreditCard,
+  GraduationCap,
+  Landmark,
   LayoutDashboard,
   LogOut,
   Menu,
   Scale,
+  TicketPercent,
   Users,
   UsersRound,
   X,
@@ -18,6 +22,7 @@ import {
 import { LanguageSwitcher } from "@/components/i18n/LanguageSwitcher";
 import { PageMeta } from "@/components/site/PageMeta";
 import { Skeleton } from "@/components/ui/skeleton";
+import { NotificationBell } from "@/components/admin/NotificationBell";
 import { useAppDispatch, useAppSelector } from "@/store/hooks";
 import { fetchAdminMe, logoutAdmin } from "@/store/slices/adminAuthSlice";
 import { cn } from "@/lib/utils";
@@ -203,44 +208,66 @@ export function AdminLayout() {
   if (!token) return <Navigate to="/acceso/equipo" replace />;
 
   const isCompany = admin?.role === "company";
+  const isInstructor = admin?.role === "instructor";
   if (admin && isCompany && !location.pathname.startsWith("/admin/empresas")) {
     return <Navigate to="/admin/empresas" replace />;
   }
   if (admin && !isCompany && location.pathname.startsWith("/admin/empresas")) {
+    return <Navigate to={isInstructor ? "/admin/mis-ediciones" : "/admin"} replace />;
+  }
+  if (admin && isInstructor && !location.pathname.startsWith("/admin/mis-ediciones")) {
+    return <Navigate to="/admin/mis-ediciones" replace />;
+  }
+  if (admin && !isInstructor && location.pathname.startsWith("/admin/mis-ediciones")) {
     return <Navigate to="/admin" replace />;
   }
 
   const loadingMe = Boolean(token && !admin);
 
-  const opsLinks = [
+  const canManageCoupons = admin?.role === "owner" || admin?.role === "finance";
+  const opsLinks: NavSection["links"] = [
     { to: "/admin", label: t("admin.dashboard"), icon: LayoutDashboard, end: true },
     { to: "/admin/cursos", label: t("admin.courses"), icon: BookOpen, end: false },
     { to: "/admin/participantes", label: t("admin.participants"), icon: Users, end: false },
     { to: "/admin/pagos", label: t("admin.payments"), icon: CreditCard, end: false },
-  ] as const;
+    { to: "/admin/transferencias", label: t("admin.transfers"), icon: Landmark, end: false },
+    ...(canManageCoupons
+      ? ([{ to: "/admin/cupones", label: t("admin.coupons"), icon: TicketPercent, end: false }] as const)
+      : []),
+  ];
 
   const contentLinks = [{ to: "/admin/legal", label: t("admin.legal"), icon: Scale, end: false }] as const;
 
-  const teamLinks = [{ to: "/admin/equipo", label: t("admin.team"), icon: UsersRound, end: false }] as const;
+  const teamLinks = [
+    { to: "/admin/instructores", label: t("admin.instructors"), icon: GraduationCap, end: false },
+    { to: "/admin/equipo", label: t("admin.team"), icon: UsersRound, end: false },
+  ] as const;
 
   const companyLinks = [
     { to: "/admin/empresas", label: t("companyPortal.title"), icon: Building2, end: false },
   ] as const;
 
+  const instructorLinks = [
+    { to: "/admin/mis-ediciones", label: t("admin.myEditions"), icon: CalendarDays, end: false },
+  ] as const;
+
   const sections: NavSection[] = isCompany
     ? [{ title: t("nav.companies"), links: companyLinks }]
-    : [
-        { title: t("admin.navOps"), links: opsLinks },
-        { title: t("admin.navContent"), links: contentLinks },
-        { title: t("admin.navTeam"), links: teamLinks },
-      ];
+    : isInstructor
+      ? [{ title: t("admin.navInstructor"), links: instructorLinks }]
+      : [
+          { title: t("admin.navOps"), links: opsLinks },
+          { title: t("admin.navContent"), links: contentLinks },
+          { title: t("admin.navTeam"), links: teamLinks },
+        ];
 
   const signOut = async () => {
     await dispatch(logoutAdmin());
     navigate("/");
   };
 
-  const homeTo = isCompany ? "/admin/empresas" : "/admin";
+  const homeTo = isCompany ? "/admin/empresas" : isInstructor ? "/admin/mis-ediciones" : "/admin";
+  const showBell = Boolean(admin && !isCompany);
 
   return (
     <div className="portal-shell flex h-dvh max-w-[100vw] overflow-hidden bg-[hsl(42_28%_95%)]">
@@ -337,18 +364,24 @@ export function AdminLayout() {
           }}
         />
 
-        <header className="relative sticky top-0 z-20 flex items-center gap-3 border-b border-border/70 bg-[hsl(42_28%_95%/0.92)] px-4 py-3 backdrop-blur lg:hidden">
+        <header className="relative sticky top-0 z-20 flex items-center gap-3 border-b border-border/70 bg-[hsl(42_28%_95%/0.92)] px-4 py-3 backdrop-blur">
           <button
             type="button"
-            className="inline-flex h-10 w-10 items-center justify-center rounded-xl border border-border bg-paper text-ink transition hover:bg-secondary"
+            className="inline-flex h-10 w-10 items-center justify-center rounded-xl border border-border bg-paper text-ink transition hover:bg-secondary lg:hidden"
             onClick={() => setMobileOpen(true)}
             aria-label={t("admin.expandNav")}
           >
             <Menu className="h-5 w-5" />
           </button>
-          <Link to={homeTo} className="font-display text-lg font-semibold tracking-tight text-ink">
+          <Link to={homeTo} className="font-display text-lg font-semibold tracking-tight text-ink lg:hidden">
             DOMINA
           </Link>
+          <div className="ml-auto flex items-center gap-2">
+            {showBell ? <NotificationBell /> : null}
+            <div className="hidden sm:block">
+              <LanguageSwitcher />
+            </div>
+          </div>
         </header>
 
         <div className="relative min-w-0 flex-1 px-4 py-6 sm:px-5 sm:py-8 lg:px-10">

@@ -13,7 +13,12 @@ import express, {
 } from "express";
 import cors from "cors";
 import rateLimit from "express-rate-limit";
-import mysql, { type Pool, type ResultSetHeader, type RowDataPacket } from "mysql2/promise";
+import mysql, {
+  type Pool,
+  type PoolConnection,
+  type ResultSetHeader,
+  type RowDataPacket,
+} from "mysql2/promise";
 import { Resend } from "resend";
 import Stripe from "stripe";
 import { z } from "zod";
@@ -406,6 +411,7 @@ async function sendSeatConfirmationEmail(input: {
     if (input.method === "transfer") return language === "en" ? "Bank transfer" : "Transferencia";
     if (input.method === "company_invoice") return language === "en" ? "Company invoice" : "Factura empresa";
     if (input.method === "complimentary") return language === "en" ? "Complimentary" : "Cortesía";
+    if (input.method === "coupon") return language === "en" ? "Coupon" : "Cupón";
     if (input.last4) {
       return language === "en"
         ? `Card ${input.brand || ""} ···· ${input.last4}`.replace(/\s+/g, " ").trim()
@@ -485,6 +491,193 @@ async function sendSeatConfirmationEmail(input: {
   ]);
 }
 
+type OxxoVoucherDetails = {
+  voucherUrl: string;
+  reference: string | null;
+  expiresAt: number | null;
+};
+
+function oxxoDetailsFromPaymentIntent(intent: Stripe.PaymentIntent | string | null | undefined): OxxoVoucherDetails | null {
+  if (!intent || typeof intent === "string") return null;
+  const details = intent.next_action?.oxxo_display_details;
+  const voucherUrl = details?.hosted_voucher_url?.trim();
+  if (!voucherUrl) return null;
+  return {
+    voucherUrl,
+    reference: details?.number?.trim() || null,
+    expiresAt: typeof details?.expires_after === "number" ? details.expires_after : null,
+  };
+}
+
+async function resolveOxxoVoucherDetails(
+  stripe: Stripe,
+  checkoutSessionId: string,
+  prefetched?: Stripe.Checkout.Session | null,
+): Promise<OxxoVoucherDetails | null> {
+  const session =
+    prefetched ||
+    (await stripe.checkout.sessions.retrieve(checkoutSessionId, {
+      expand: ["payment_intent"],
+    }));
+  const fromSession = oxxoDetailsFromPaymentIntent(
+    session.payment_intent as Stripe.PaymentIntent | string | null | undefined,
+  );
+  if (fromSession) return fromSession;
+
+  const intentId =
+    typeof session.payment_intent === "string"
+      ? session.payment_intent
+      : session.payment_intent && typeof session.payment_intent === "object"
+        ? session.payment_intent.id
+        : null;
+  if (!intentId) return null;
+  const intent = await stripe.paymentIntents.retrieve(intentId);
+  return oxxoDetailsFromPaymentIntent(intent);
+}
+
+function formatOxxoExpiry(expiresAt: number | null, language: AppLanguage): string {
+  if (!expiresAt) {
+    return language === "en" ? "Within 3 days" : "Dentro de 3 días";
+  }
+  const locale = language === "en" ? "en-US" : "es-MX";
+  return new Intl.DateTimeFormat(locale, {
+    weekday: "short",
+    day: "numeric",
+    month: "short",
+    year: "numeric",
+    hour: "2-digit",
+    minute: "2-digit",
+    timeZone: "America/Mexico_City",
+  }).format(new Date(expiresAt * 1000));
+}
+
+/** Branded OXXO voucher email with hosted barcode link. Exported for integration tests. */
+export async function sendOxxoVoucherEmail(input: {
+  enrollmentId: number;
+  checkoutSessionId: string;
+  session?: Stripe.Checkout.Session | null;
+}): Promise<{ skipped: boolean; sent: boolean; reason?: string }> {
+  const [rows] = await db().query<RowDataPacket[]>(
+    `SELECT u.email, u.first_name, u.last_name, u.preferred_language,
+            e.amount_cents, e.currency, e.status,
+            c.title, c.promise,
+            ed.starts_at, ed.ends_at, ed.venue_name, ed.venue_address, ed.city
+       FROM enrollments e
+       JOIN users u ON u.id = e.user_id
+       JOIN course_editions ed ON ed.id = e.edition_id
+       JOIN courses c ON c.id = ed.course_id
+      WHERE e.id = ?
+      LIMIT 1`,
+    [input.enrollmentId],
+  );
+  const row = rows[0];
+  if (!row?.email) return { skipped: true, sent: false, reason: "missing_enrollment" };
+  if (row.status === "paid" || row.status === "attended") {
+    return { skipped: true, sent: false, reason: "already_paid" };
+  }
+
+  let voucher: OxxoVoucherDetails | null = null;
+  const stripe = stripeClient();
+  if (stripe) {
+    try {
+      voucher = await resolveOxxoVoucherDetails(stripe, input.checkoutSessionId, input.session || null);
+    } catch (error) {
+      console.error("oxxo voucher resolve", error);
+    }
+  }
+  if (!voucher?.voucherUrl) {
+    // VITEST / missing Stripe details — still "succeed" without sending live mail.
+    if (process.env.VITEST === "true" || !stripe) {
+      return { skipped: true, sent: false, reason: "no_voucher_url" };
+    }
+    return { skipped: true, sent: false, reason: "no_voucher_url" };
+  }
+
+  const language: AppLanguage = row.preferred_language === "en" ? "en" : "es";
+  const firstName = String(row.first_name || "").trim();
+  const title = String(row.title || "");
+  const promise = String(row.promise || "");
+  const venueName = String(row.venue_name || "");
+  const venueAddress = String(row.venue_address || "");
+  const city = String(row.city || "");
+  const when = formatWorkshopWhen(row.starts_at, row.ends_at, language);
+  const where = [venueName, venueAddress, city].filter(Boolean).join(" · ") || city || "Guadalajara";
+  const amount = money(Number(row.amount_cents || 0), String(row.currency || "MXN"), language);
+  const expiresLabel = formatOxxoExpiry(voucher.expiresAt, language);
+  const accountUrl = `${publicSiteUrl()}/cuenta`;
+  const payUrl = `${publicSiteUrl()}/cuenta/pagar/${input.enrollmentId}`;
+
+  const copy =
+    language === "en"
+      ? {
+          subject: `OXXO voucher · ${title}`,
+          headline: "Your OXXO voucher is ready.",
+          hello: firstName ? `Hi ${escapeHtml(firstName)},` : "Hi,",
+          lead: `Pay in cash at any OXXO to lock your seat in <strong>${escapeHtml(title)}</strong>. Show the barcode below — no card needed.`,
+          amount: "Amount",
+          reference: "Reference",
+          expires: "Pay before",
+          when: "Workshop",
+          where: "Where",
+          promise: "What you'll leave with",
+          cta: "Open OXXO voucher",
+          secondary: "Back to checkout",
+          tip: "Keep this email until the cashier confirms payment. Once cash clears, your seat flips to paid automatically.",
+          footer: "See you in the room.",
+        }
+      : {
+          subject: `Voucher OXXO · ${title}`,
+          headline: "Tu voucher OXXO está listo.",
+          hello: firstName ? `Hola ${escapeHtml(firstName)},` : "Hola,",
+          lead: `Paga en efectivo en cualquier OXXO para asegurar tu lugar en <strong>${escapeHtml(title)}</strong>. Muestra el código de barras — sin tarjeta.`,
+          amount: "Monto",
+          reference: "Referencia",
+          expires: "Paga antes de",
+          when: "Taller",
+          where: "Dónde",
+          promise: "Con lo que te vas",
+          cta: "Abrir voucher OXXO",
+          secondary: "Volver al checkout",
+          tip: "Guarda este correo hasta que la caja confirme el pago. Cuando entre el efectivo, tu lugar pasa a pagado solo.",
+          footer: "Te esperamos en la práctica.",
+        };
+
+  const body = `
+    <p style="margin:0 0 14px;">${copy.hello}</p>
+    <p style="margin:0 0 22px;">${copy.lead}</p>
+    <div style="margin:0 0 22px;padding:22px 20px;border-radius:18px;background:linear-gradient(135deg,#12352b 0%,#1a4a3c 55%,#24352b 100%);color:#f6f3ec;">
+      <div style="font-size:11px;letter-spacing:.2em;font-weight:700;color:#d6f25c;text-transform:uppercase;">OXXO</div>
+      <div style="margin-top:8px;font-size:34px;line-height:1.1;font-weight:800;letter-spacing:-0.02em;">${escapeHtml(amount)}</div>
+      ${
+        voucher.reference
+          ? `<div style="margin-top:14px;font-size:12px;letter-spacing:.08em;text-transform:uppercase;color:rgba(246,243,236,.7);">${copy.reference}</div>
+             <div style="margin-top:4px;font-size:18px;font-weight:700;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;letter-spacing:.06em;">${escapeHtml(voucher.reference)}</div>`
+          : ""
+      }
+      <div style="margin-top:14px;font-size:12px;color:rgba(246,243,236,.75);">${copy.expires}: <strong style="color:#d6f25c;">${escapeHtml(expiresLabel)}</strong></div>
+    </div>
+    <p style="margin:0 0 18px;">
+      <a href="${escapeHtml(voucher.voucherUrl)}" style="display:inline-block;background:#d6f25c;color:#12352b;text-decoration:none;font-weight:800;font-size:14px;letter-spacing:.03em;padding:15px 22px;border-radius:999px;">${copy.cta}</a>
+    </p>
+    <p style="margin:0 0 22px;">
+      <a href="${payUrl}" style="display:inline-block;color:#12352b;text-decoration:underline;font-weight:700;font-size:13px;">${copy.secondary}</a>
+      &nbsp;·&nbsp;
+      <a href="${accountUrl}" style="display:inline-block;color:#6d6a62;text-decoration:underline;font-weight:600;font-size:13px;">${language === "en" ? "My practice" : "Mi práctica"}</a>
+    </p>
+    <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="margin:0 0 18px;">
+      ${detailRow(copy.when, escapeHtml(when))}
+      ${detailRow(copy.where, escapeHtml(where))}
+      ${detailRow(copy.amount, escapeHtml(amount))}
+      ${promise ? detailRow(copy.promise, escapeHtml(promise)) : ""}
+    </table>
+    <p style="margin:0 0 10px;font-size:13px;color:#6d6a62;">${copy.tip}</p>
+    <p style="margin:0;font-size:14px;font-weight:600;color:#12352b;">${copy.footer}</p>
+  `;
+
+  const result = await sendEmail(String(row.email), copy.subject, emailShell(copy.headline, body, language));
+  return { skipped: Boolean(result.skipped), sent: !result.skipped };
+}
+
 function roleLabel(role: AdminRole, language: AppLanguage): string {
   const map: Record<AdminRole, { es: string; en: string }> = {
     owner: { es: "Owner", en: "Owner" },
@@ -541,6 +734,189 @@ async function sendStaffWelcomeEmail(input: {
     <p style="margin:0;font-size:13px;color:#6d6a62;">${copy.tip}</p>
   `;
   return sendEmail(input.email, copy.subject, emailShell(copy.headline, body, language));
+}
+
+async function createAdminNotification(input: {
+  adminId: number;
+  kind: string;
+  title: string;
+  body: string;
+  linkPath?: string | null;
+  enrollmentId?: number | null;
+  editionId?: number | null;
+}) {
+  await db().execute(
+    `INSERT INTO admin_notifications (
+       admin_id, kind, title, body, link_path, enrollment_id, edition_id
+     ) VALUES (?, ?, ?, ?, ?, ?, ?)`,
+    [
+      input.adminId,
+      input.kind.slice(0, 40),
+      input.title.slice(0, 200),
+      input.body.slice(0, 500),
+      input.linkPath || null,
+      input.enrollmentId ?? null,
+      input.editionId ?? null,
+    ],
+  );
+}
+
+async function sendInstructorEnrollmentEmail(input: {
+  email: string;
+  firstName: string;
+  preferredLanguage: AppLanguage | null;
+  learnerName: string;
+  learnerEmail: string;
+  courseTitle: string;
+  whenLabel: string;
+  methodLabel: string;
+  editionId: number;
+}) {
+  const language: AppLanguage = input.preferredLanguage === "en" ? "en" : "es";
+  const rosterUrl = `${publicSiteUrl()}/admin/mis-ediciones/${input.editionId}`;
+  const copy =
+    language === "en"
+      ? {
+          subject: `New paid seat · ${input.courseTitle}`,
+          headline: "A learner just locked a seat.",
+          hello: input.firstName ? `Hi ${escapeHtml(input.firstName)},` : "Hi,",
+          lead: `<strong>${escapeHtml(input.learnerName)}</strong> paid for <strong>${escapeHtml(input.courseTitle)}</strong>.`,
+          learner: "Learner",
+          when: "When",
+          method: "Method",
+          cta: "Open my roster",
+        }
+      : {
+          subject: `Nueva inscripción · ${input.courseTitle}`,
+          headline: "Un participante aseguró su lugar.",
+          hello: input.firstName ? `Hola ${escapeHtml(input.firstName)},` : "Hola,",
+          lead: `<strong>${escapeHtml(input.learnerName)}</strong> pagó <strong>${escapeHtml(input.courseTitle)}</strong>.`,
+          learner: "Participante",
+          when: "Cuándo",
+          method: "Método",
+          cta: "Abrir mi lista",
+        };
+
+  const body = `
+    <p style="margin:0 0 14px;">${copy.hello}</p>
+    <p style="margin:0 0 22px;">${copy.lead}</p>
+    <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="margin:0 0 22px;">
+      ${detailRow(copy.learner, escapeHtml(`${input.learnerName} · ${input.learnerEmail}`))}
+      ${detailRow(copy.when, escapeHtml(input.whenLabel))}
+      ${detailRow(copy.method, escapeHtml(input.methodLabel))}
+    </table>
+    <p style="margin:0;">
+      <a href="${rosterUrl}" style="display:inline-block;background:#12352b;color:#d6f25c;text-decoration:none;font-weight:700;font-size:13px;letter-spacing:.04em;padding:14px 20px;border-radius:999px;">${copy.cta}</a>
+    </p>
+  `;
+  return sendEmail(input.email, copy.subject, emailShell(copy.headline, body, language));
+}
+
+/** Email + in-app bell for the edition's assigned instructor when a seat becomes paid. */
+export async function notifyInstructorOfPaidEnrollment(
+  enrollmentId: number,
+  method: PaymentMethod,
+): Promise<void> {
+  const [rows] = await db().query<RowDataPacket[]>(
+    `SELECT e.id AS enrollment_id, e.edition_id, e.amount_cents, e.currency,
+            u.email AS learner_email, u.first_name AS learner_first, u.last_name AS learner_last,
+            c.title AS course_title,
+            ed.starts_at, ed.ends_at, ed.instructor_admin_id,
+            a.email AS instructor_email, a.first_name AS instructor_first,
+            a.preferred_language AS instructor_language, a.status AS instructor_status
+       FROM enrollments e
+       JOIN users u ON u.id = e.user_id
+       JOIN course_editions ed ON ed.id = e.edition_id
+       JOIN courses c ON c.id = ed.course_id
+       LEFT JOIN admins a ON a.id = ed.instructor_admin_id AND a.role = 'instructor'
+      WHERE e.id = ?
+      LIMIT 1`,
+    [enrollmentId],
+  );
+  const row = rows[0];
+  if (!row?.instructor_admin_id || !row.instructor_email) return;
+  if (row.instructor_status === "disabled") return;
+
+  const language: AppLanguage = row.instructor_language === "en" ? "en" : "es";
+  const learnerName =
+    `${String(row.learner_first || "").trim()} ${String(row.learner_last || "").trim()}`.trim() ||
+    String(row.learner_email);
+  const whenLabel = formatWorkshopWhen(row.starts_at, row.ends_at, language);
+  const methodLabel =
+    method === "oxxo"
+      ? "OXXO"
+      : method === "transfer"
+        ? language === "en"
+          ? "Bank transfer"
+          : "Transferencia"
+        : method === "company_invoice"
+          ? language === "en"
+            ? "Company invoice"
+            : "Factura empresa"
+          : method === "complimentary"
+            ? language === "en"
+              ? "Complimentary"
+              : "Cortesía"
+            : method === "coupon"
+              ? language === "en"
+                ? "Coupon"
+                : "Cupón"
+              : language === "en"
+                ? "Card"
+                : "Tarjeta";
+  const title =
+    language === "en"
+      ? `New paid seat · ${row.course_title}`
+      : `Nueva inscripción · ${row.course_title}`;
+  const body =
+    language === "en"
+      ? `${learnerName} paid for ${row.course_title}`
+      : `${learnerName} pagó ${row.course_title}`;
+  const editionId = Number(row.edition_id);
+  const linkPath = `/admin/mis-ediciones/${editionId}`;
+  const instructorAdminId = Number(row.instructor_admin_id);
+
+  // One bell row per paid enrollment (idempotent on retries / double fulfill).
+  const [existingNotes] = await db().query<RowDataPacket[]>(
+    `SELECT id FROM admin_notifications
+      WHERE admin_id = ? AND enrollment_id = ? AND kind = 'enrollment_paid'
+      LIMIT 1`,
+    [instructorAdminId, enrollmentId],
+  );
+  if (existingNotes[0]) return;
+
+  await createAdminNotification({
+    adminId: instructorAdminId,
+    kind: "enrollment_paid",
+    title,
+    body,
+    linkPath,
+    enrollmentId,
+    editionId,
+  });
+
+  await sendInstructorEnrollmentEmail({
+    email: String(row.instructor_email),
+    firstName: String(row.instructor_first || ""),
+    preferredLanguage: language,
+    learnerName,
+    learnerEmail: String(row.learner_email || ""),
+    courseTitle: String(row.course_title || ""),
+    whenLabel,
+    methodLabel,
+    editionId,
+  });
+}
+
+async function assertAssignableInstructor(instructorAdminId: number | null | undefined): Promise<boolean> {
+  if (instructorAdminId == null) return true;
+  const [rows] = await db().query<RowDataPacket[]>(
+    `SELECT id FROM admins
+      WHERE id = ? AND role = 'instructor' AND status IN ('active', 'invited')
+      LIMIT 1`,
+    [instructorAdminId],
+  );
+  return Boolean(rows[0]);
 }
 
 async function storeLoginCode(
@@ -600,8 +976,9 @@ function adminFromRow(row: RowDataPacket): AdminProfile {
   };
 }
 
+/** Ops staff with full admin APIs. Instructors are gated to /api/instructor/* only. */
 function isOpsStaff(admin: AdminProfile) {
-  return admin.role === "owner" || admin.role === "coordinator" || admin.role === "instructor" || admin.role === "finance";
+  return admin.role === "owner" || admin.role === "coordinator" || admin.role === "finance";
 }
 
 function isCompanyRole(admin: AdminProfile) {
@@ -610,6 +987,119 @@ function isCompanyRole(admin: AdminProfile) {
 
 function canWriteOperations(admin: AdminProfile) {
   return admin.role === "owner" || admin.role === "coordinator";
+}
+
+/** Owners and coordinators manage the Instructores roster and invitations. */
+function canManageInstructors(admin: AdminProfile) {
+  return admin.role === "owner" || admin.role === "coordinator";
+}
+
+function isInstructorRole(admin: AdminProfile) {
+  return admin.role === "instructor";
+}
+
+/** Owner, finance, and coordinator may confirm/reject SPEI transfers and edit bank settings. */
+function canManageTransfers(admin: AdminProfile) {
+  return admin.role === "owner" || admin.role === "finance" || admin.role === "coordinator";
+}
+
+/** Owner and finance manage DOMINA-owned coupon codes. */
+function canManageCoupons(admin: AdminProfile) {
+  return admin.role === "owner" || admin.role === "finance";
+}
+
+function transferReferenceFor(enrollmentId: number) {
+  return `DOMINA-${enrollmentId}`;
+}
+
+function normalizeCouponCode(raw: string) {
+  return String(raw || "")
+    .trim()
+    .toUpperCase()
+    .replace(/\s+/g, "");
+}
+
+function computeCouponDiscount(input: {
+  listAmountCents: number;
+  discountType: "percent" | "fixed";
+  percentOff: number | null;
+  amountOffCents: number | null;
+}): { discountCents: number; finalAmountCents: number } {
+  const list = Math.max(0, Math.floor(input.listAmountCents));
+  let discount = 0;
+  if (input.discountType === "percent") {
+    const pct = Math.min(100, Math.max(0, Number(input.percentOff || 0)));
+    discount = Math.min(list, Math.floor((list * pct) / 100));
+  } else {
+    discount = Math.min(list, Math.max(0, Math.floor(Number(input.amountOffCents || 0))));
+  }
+  return { discountCents: discount, finalAmountCents: Math.max(0, list - discount) };
+}
+
+type BankTransferSettings = {
+  bankName: string;
+  accountHolder: string;
+  clabe: string;
+  accountNumber: string | null;
+  bankCode: string | null;
+  instructionsEs: string | null;
+  instructionsEn: string | null;
+  expiresAfterDays: number;
+  isEnabled: boolean;
+};
+
+function bankSettingsFromRow(row: RowDataPacket): BankTransferSettings {
+  return {
+    bankName: String(row.bank_name || ""),
+    accountHolder: String(row.account_holder || ""),
+    clabe: String(row.clabe || ""),
+    accountNumber: row.account_number ? String(row.account_number) : null,
+    bankCode: row.bank_code ? String(row.bank_code) : null,
+    instructionsEs: row.instructions_es ? String(row.instructions_es) : null,
+    instructionsEn: row.instructions_en ? String(row.instructions_en) : null,
+    expiresAfterDays: Math.max(1, Number(row.expires_after_days || 3)),
+    isEnabled: Number(row.is_enabled) === 1,
+  };
+}
+
+async function loadBankTransferSettings(): Promise<BankTransferSettings | null> {
+  const [rows] = await db().query<RowDataPacket[]>(
+    "SELECT * FROM site_bank_transfer_settings WHERE id = 1 LIMIT 1",
+  );
+  if (!rows[0]) return null;
+  return bankSettingsFromRow(rows[0]);
+}
+
+function transferInstructionsPayload(input: {
+  enrollmentId: number;
+  paymentId: number;
+  reference: string;
+  expiresAt: string;
+  amountCents: number;
+  currency: string;
+  settings: BankTransferSettings;
+  language: AppLanguage;
+}) {
+  return {
+    status: "pending_transfer" as const,
+    enrollmentId: input.enrollmentId,
+    paymentId: input.paymentId,
+    reference: input.reference,
+    expiresAt: input.expiresAt,
+    amountCents: input.amountCents,
+    currency: input.currency,
+    bank: {
+      bankName: input.settings.bankName,
+      accountHolder: input.settings.accountHolder,
+      clabe: input.settings.clabe,
+      accountNumber: input.settings.accountNumber,
+      bankCode: input.settings.bankCode,
+      instructions:
+        input.language === "en"
+          ? input.settings.instructionsEn || input.settings.instructionsEs
+          : input.settings.instructionsEs || input.settings.instructionsEn,
+    },
+  };
 }
 
 function editionFromRow(row: RowDataPacket): CourseEdition {
@@ -981,7 +1471,25 @@ function cardDetailsFromSession(session: Stripe.Checkout.Session): {
   return { brand, last4, paymentIntentId };
 }
 
-/** Fulfill a seat after Stripe (or VITEST simulate). Exported for payment/webhook integration tests. */
+/** Mark an enrollment as waiting on OXXO cash (voucher issued, session complete + unpaid). */
+export async function markEnrollmentPendingOxxo(input: {
+  enrollmentId: number;
+  checkoutSessionId: string;
+}): Promise<void> {
+  await db().execute(
+    "UPDATE payments SET method = 'oxxo', status = 'processing' WHERE stripe_checkout_session_id = ?",
+    [input.checkoutSessionId],
+  );
+  await db().execute(
+    `UPDATE enrollments
+        SET payment_method = 'oxxo',
+            stripe_checkout_session_id = COALESCE(?, stripe_checkout_session_id)
+      WHERE id = ? AND status = 'pending'`,
+    [input.checkoutSessionId, input.enrollmentId],
+  );
+}
+
+/** Fulfill a seat after Stripe, SPEI confirm, or VITEST simulate. Exported for payment/webhook integration tests. */
 export async function markEnrollmentPaid(input: {
   enrollmentId: number;
   checkoutSessionId: string | null;
@@ -989,6 +1497,8 @@ export async function markEnrollmentPaid(input: {
   brand: string | null;
   last4: string | null;
   method: PaymentMethod;
+  /** When set, update this payments row instead of inserting a new ledger entry. */
+  paymentId?: number | null;
 }): Promise<{ newlyPaid: boolean }> {
   const [rows] = await db().query<RowDataPacket[]>(
     "SELECT * FROM enrollments WHERE id = ? LIMIT 1",
@@ -996,14 +1506,27 @@ export async function markEnrollmentPaid(input: {
   );
   const enrollment = rows[0];
   if (!enrollment) return { newlyPaid: false };
-  const newlyPaid = enrollment.status !== "paid" && enrollment.status !== "attended";
-  await db().execute(
+  // Do not revive cancelled / no-show seats via late webhooks or SPEI confirm.
+  if (enrollment.status === "cancelled" || enrollment.status === "no_show") {
+    return { newlyPaid: false };
+  }
+  // Superseded Stripe session (e.g. learner switched OXXO → SPEI): ignore late cash/card settle.
+  if (input.checkoutSessionId) {
+    const [sessionPay] = await db().query<RowDataPacket[]>(
+      "SELECT id, status FROM payments WHERE stripe_checkout_session_id = ? LIMIT 1",
+      [input.checkoutSessionId],
+    );
+    if (sessionPay[0]?.status === "failed") {
+      return { newlyPaid: false };
+    }
+  }
+  const [paidUpdate] = await db().execute<ResultSetHeader>(
     `UPDATE enrollments
         SET status = 'paid', payment_method = ?, card_brand = ?, card_last4 = ?,
             stripe_checkout_session_id = COALESCE(?, stripe_checkout_session_id),
             stripe_payment_intent_id = COALESCE(?, stripe_payment_intent_id),
             paid_at = COALESCE(paid_at, NOW())
-      WHERE id = ?`,
+      WHERE id = ? AND status IN ('pending', 'waitlist')`,
     [
       input.method,
       input.brand,
@@ -1013,7 +1536,26 @@ export async function markEnrollmentPaid(input: {
       input.enrollmentId,
     ],
   );
-  if (input.checkoutSessionId) {
+  const newlyPaid = paidUpdate.affectedRows > 0;
+  if (!newlyPaid) {
+    const [again] = await db().query<RowDataPacket[]>(
+      "SELECT status FROM enrollments WHERE id = ? LIMIT 1",
+      [input.enrollmentId],
+    );
+    if (again[0]?.status !== "paid" && again[0]?.status !== "attended") {
+      return { newlyPaid: false };
+    }
+  }
+  if (input.paymentId) {
+    await db().execute(
+      `UPDATE payments
+          SET status = 'succeeded', method = ?, card_brand = ?, card_last4 = ?,
+              stripe_payment_intent_id = COALESCE(?, stripe_payment_intent_id),
+              updated_at = CURRENT_TIMESTAMP
+        WHERE id = ?`,
+      [input.method, input.brand, input.last4, input.paymentIntentId, input.paymentId],
+    );
+  } else if (input.checkoutSessionId) {
     const [existing] = await db().query<RowDataPacket[]>(
       "SELECT id FROM payments WHERE stripe_checkout_session_id = ? LIMIT 1",
       [input.checkoutSessionId],
@@ -1024,29 +1566,482 @@ export async function markEnrollmentPaid(input: {
           WHERE id = ?`,
         [input.method, input.brand, input.last4, input.paymentIntentId, existing[0].id],
       );
-      return { newlyPaid };
+    } else {
+      try {
+        await db().execute(
+          `INSERT INTO payments (
+             enrollment_id, user_id, company_id, edition_id, amount_cents, currency, status, method,
+             card_brand, card_last4, stripe_checkout_session_id, stripe_payment_intent_id
+           ) VALUES (?, ?, ?, ?, ?, ?, 'succeeded', ?, ?, ?, ?, ?)`,
+          [
+            enrollment.id,
+            enrollment.user_id,
+            enrollment.company_id,
+            enrollment.edition_id,
+            enrollment.amount_cents,
+            enrollment.currency,
+            input.method,
+            input.brand,
+            input.last4,
+            input.checkoutSessionId,
+            input.paymentIntentId,
+          ],
+        );
+      } catch (error) {
+        if (!isDuplicateKeyError(error as { code?: string; errno?: number; message?: string })) throw error;
+        await db().execute(
+          `UPDATE payments
+              SET status = 'succeeded', method = ?, card_brand = ?, card_last4 = ?,
+                  stripe_payment_intent_id = COALESCE(?, stripe_payment_intent_id)
+            WHERE stripe_checkout_session_id = ?`,
+          [input.method, input.brand, input.last4, input.paymentIntentId, input.checkoutSessionId],
+        );
+      }
+    }
+  } else {
+    await db().execute(
+      `INSERT INTO payments (
+         enrollment_id, user_id, company_id, edition_id, amount_cents, currency, status, method,
+         card_brand, card_last4, stripe_checkout_session_id, stripe_payment_intent_id
+       ) VALUES (?, ?, ?, ?, ?, ?, 'succeeded', ?, ?, ?, ?, ?)`,
+      [
+        enrollment.id,
+        enrollment.user_id,
+        enrollment.company_id,
+        enrollment.edition_id,
+        enrollment.amount_cents,
+        enrollment.currency,
+        input.method,
+        input.brand,
+        input.last4,
+        input.checkoutSessionId,
+        input.paymentIntentId,
+      ],
+    );
+  }
+
+  if (newlyPaid) {
+    if (enrollment.coupon_id) {
+      try {
+        await consumeCouponRedemption(Number(enrollment.id));
+      } catch (error) {
+        console.error("coupon redemption consume", error);
+      }
+    }
+    try {
+      await notifyInstructorOfPaidEnrollment(input.enrollmentId, input.method);
+    } catch (error) {
+      console.error("instructor paid notification", error);
+    }
+  }
+  return { newlyPaid };
+}
+
+async function invalidateOpenCheckoutForEnrollment(enrollmentId: number, reason: string) {
+  await cancelActiveTransferForEnrollment(enrollmentId, reason);
+  const [rows] = await db().query<RowDataPacket[]>(
+    "SELECT stripe_checkout_session_id FROM enrollments WHERE id = ? LIMIT 1",
+    [enrollmentId],
+  );
+  const sessionId = rows[0]?.stripe_checkout_session_id ? String(rows[0].stripe_checkout_session_id) : "";
+  if (sessionId) {
+    const stripe = stripeClient();
+    if (stripe) {
+      try {
+        await stripe.checkout.sessions.expire(sessionId);
+      } catch (error) {
+        console.warn("stripe session expire on coupon change", error);
+      }
     }
   }
   await db().execute(
-    `INSERT INTO payments (
-       enrollment_id, user_id, company_id, edition_id, amount_cents, currency, status, method,
-       card_brand, card_last4, stripe_checkout_session_id, stripe_payment_intent_id
-     ) VALUES (?, ?, ?, ?, ?, ?, 'succeeded', ?, ?, ?, ?, ?)`,
-    [
-      enrollment.id,
-      enrollment.user_id,
-      enrollment.company_id,
-      enrollment.edition_id,
-      enrollment.amount_cents,
-      enrollment.currency,
-      input.method,
-      input.brand,
-      input.last4,
-      input.checkoutSessionId,
-      input.paymentIntentId,
-    ],
+    `UPDATE payments
+        SET status = 'failed',
+            reject_reason = COALESCE(reject_reason, ?),
+            updated_at = CURRENT_TIMESTAMP
+      WHERE enrollment_id = ?
+        AND status IN ('requires_payment', 'processing')`,
+    [reason.slice(0, 400), enrollmentId],
   );
-  return { newlyPaid };
+  await db().execute(
+    `UPDATE enrollments
+        SET stripe_checkout_session_id = NULL,
+            stripe_payment_intent_id = NULL,
+            payment_method = NULL
+      WHERE id = ? AND status = 'pending'`,
+    [enrollmentId],
+  );
+}
+
+type DbQueryable = Pick<Pool, "query" | "execute">;
+
+/** Applied holds older than this are released so max_redemptions inventory is not stuck. */
+const COUPON_HOLD_TTL_HOURS = 48;
+
+async function countActiveCouponHolds(
+  couponId: number,
+  exec: DbQueryable = db(),
+): Promise<number> {
+  const [rows] = await exec.query<RowDataPacket[]>(
+    `SELECT COUNT(*) AS total
+       FROM coupon_redemptions
+      WHERE coupon_id = ? AND status IN ('applied', 'consumed')`,
+    [couponId],
+  );
+  return Number(rows[0]?.total || 0);
+}
+
+async function loadCouponForApply(
+  code: string,
+  exec: DbQueryable = db(),
+  forUpdate = false,
+): Promise<RowDataPacket | null> {
+  const [rows] = await exec.query<RowDataPacket[]>(
+    `SELECT * FROM coupons WHERE code = ? LIMIT 1${forUpdate ? " FOR UPDATE" : ""}`,
+    [normalizeCouponCode(code)],
+  );
+  return rows[0] || null;
+}
+
+async function couponInScope(
+  coupon: RowDataPacket,
+  courseId: number,
+  editionId: number,
+  exec: DbQueryable = db(),
+): Promise<boolean> {
+  const scope = String(coupon.scope || "all");
+  if (scope === "all") return true;
+  if (scope === "course") {
+    const [rows] = await exec.query<RowDataPacket[]>(
+      "SELECT 1 AS ok FROM coupon_courses WHERE coupon_id = ? AND course_id = ? LIMIT 1",
+      [coupon.id, courseId],
+    );
+    return Boolean(rows[0]);
+  }
+  if (scope === "edition") {
+    const [rows] = await exec.query<RowDataPacket[]>(
+      "SELECT 1 AS ok FROM coupon_editions WHERE coupon_id = ? AND edition_id = ? LIMIT 1",
+      [coupon.id, editionId],
+    );
+    return Boolean(rows[0]);
+  }
+  return false;
+}
+
+type CouponApplyError = { status: number; error: string; code: string };
+
+async function validateCouponForEnrollment(
+  input: {
+    coupon: RowDataPacket;
+    enrollmentId: number;
+    userId: number;
+    courseId: number;
+    editionId: number;
+    listAmountCents: number;
+  },
+  exec: DbQueryable = db(),
+): Promise<CouponApplyError | { discountCents: number; finalAmountCents: number }> {
+  const coupon = input.coupon;
+  if (!Number(coupon.active)) {
+    return { status: 404, error: "That coupon is not available.", code: "coupon_inactive" };
+  }
+  const now = Date.now();
+  if (coupon.starts_at && new Date(coupon.starts_at).getTime() > now) {
+    return { status: 409, error: "That coupon is not active yet.", code: "coupon_not_started" };
+  }
+  if (coupon.ends_at && new Date(coupon.ends_at).getTime() < now) {
+    return { status: 409, error: "That coupon has expired.", code: "coupon_expired" };
+  }
+  if (String(coupon.currency || "MXN").toUpperCase() !== "MXN") {
+    return { status: 409, error: "That coupon currency is not supported.", code: "coupon_currency" };
+  }
+  if (!(await couponInScope(coupon, input.courseId, input.editionId, exec))) {
+    return { status: 409, error: "That coupon does not apply to this workshop.", code: "coupon_scope" };
+  }
+
+  const [userUsed] = await exec.query<RowDataPacket[]>(
+    `SELECT id FROM coupon_redemptions
+      WHERE coupon_id = ? AND user_id = ?
+        AND (
+          status = 'consumed'
+          OR (status = 'applied' AND enrollment_id <> ?)
+        )
+      LIMIT 1`,
+    [coupon.id, input.userId, input.enrollmentId],
+  );
+  if (userUsed[0]) {
+    return { status: 409, error: "You already used this coupon.", code: "coupon_user_limit" };
+  }
+
+  const max = coupon.max_redemptions == null ? null : Number(coupon.max_redemptions);
+  if (max != null && Number.isFinite(max)) {
+    const [selfHold] = await exec.query<RowDataPacket[]>(
+      `SELECT id FROM coupon_redemptions
+        WHERE coupon_id = ? AND enrollment_id = ? AND status IN ('applied', 'consumed')
+        LIMIT 1`,
+      [coupon.id, input.enrollmentId],
+    );
+    const held = await countActiveCouponHolds(Number(coupon.id), exec);
+    const effective = selfHold[0] ? held : held + 1;
+    if (effective > max) {
+      return { status: 409, error: "This coupon has reached its redemption limit.", code: "coupon_maxed" };
+    }
+  }
+
+  const discountType = coupon.discount_type === "fixed" ? "fixed" : "percent";
+  return computeCouponDiscount({
+    listAmountCents: input.listAmountCents,
+    discountType,
+    percentOff: coupon.percent_off == null ? null : Number(coupon.percent_off),
+    amountOffCents: coupon.amount_off_cents == null ? null : Number(coupon.amount_off_cents),
+  });
+}
+
+/** Release abandoned applied holds and restore pending seat list prices. */
+export async function expireStaleCouponHolds(enrollmentId?: number): Promise<number> {
+  const params: unknown[] = [COUPON_HOLD_TTL_HOURS];
+  let enrollmentFilter = "";
+  if (enrollmentId != null && Number.isFinite(enrollmentId) && enrollmentId > 0) {
+    enrollmentFilter = " AND r.enrollment_id = ?";
+    params.push(enrollmentId);
+  }
+  const [stale] = await db().query<RowDataPacket[]>(
+    `SELECT r.id AS redemption_id, r.enrollment_id, e.status AS enrollment_status,
+            e.list_amount_cents, ed.price_cents AS edition_price_cents
+       FROM coupon_redemptions r
+       JOIN enrollments e ON e.id = r.enrollment_id
+       JOIN course_editions ed ON ed.id = e.edition_id
+      WHERE r.status = 'applied'
+        AND r.created_at < DATE_SUB(NOW(), INTERVAL ? HOUR)
+        ${enrollmentFilter}`,
+    params,
+  );
+  let released = 0;
+  for (const row of stale) {
+    await db().execute(
+      `UPDATE coupon_redemptions
+          SET status = 'released', updated_at = CURRENT_TIMESTAMP
+        WHERE id = ? AND status = 'applied'`,
+      [row.redemption_id],
+    );
+    if (row.enrollment_status === "pending" || row.enrollment_status === "waitlist") {
+      const restoreCents = Number(row.list_amount_cents ?? row.edition_price_cents ?? 0);
+      await invalidateOpenCheckoutForEnrollment(Number(row.enrollment_id), "coupon_hold_expired");
+      await db().execute(
+        `UPDATE enrollments
+            SET coupon_id = NULL,
+                list_amount_cents = NULL,
+                discount_cents = 0,
+                amount_cents = ?,
+                payment_method = NULL,
+                stripe_checkout_session_id = NULL,
+                stripe_payment_intent_id = NULL
+          WHERE id = ? AND status IN ('pending', 'waitlist') AND coupon_id IS NOT NULL`,
+        [restoreCents, row.enrollment_id],
+      );
+    }
+    released += 1;
+  }
+  return released;
+}
+
+function couponSummaryFromRows(
+  coupon: {
+    id: unknown;
+    code: unknown;
+    name: unknown;
+    discount_type: unknown;
+    percent_off: unknown;
+    amount_off_cents: unknown;
+  } | null | undefined,
+  enrollment: RowDataPacket,
+) {
+  if (!coupon || !enrollment.coupon_id) return null;
+  return {
+    id: Number(coupon.id),
+    code: String(coupon.code),
+    name: String(coupon.name),
+    discountType: coupon.discount_type === "fixed" ? ("fixed" as const) : ("percent" as const),
+    percentOff: coupon.percent_off == null ? null : Number(coupon.percent_off),
+    amountOffCents: coupon.amount_off_cents == null ? null : Number(coupon.amount_off_cents),
+    listAmountCents: Number(enrollment.list_amount_cents ?? enrollment.amount_cents),
+    discountCents: Number(enrollment.discount_cents || 0),
+    finalAmountCents: Number(enrollment.amount_cents),
+  };
+}
+
+async function consumeCouponRedemption(enrollmentId: number) {
+  await db().execute(
+    `UPDATE coupon_redemptions
+        SET status = 'consumed', updated_at = CURRENT_TIMESTAMP
+      WHERE enrollment_id = ? AND status = 'applied'`,
+    [enrollmentId],
+  );
+}
+
+async function releaseCouponRedemption(enrollmentId: number) {
+  await db().execute(
+    `UPDATE coupon_redemptions
+        SET status = 'released', updated_at = CURRENT_TIMESTAMP
+      WHERE enrollment_id = ? AND status = 'applied'`,
+    [enrollmentId],
+  );
+}
+
+/** Mark expired SPEI rows failed and reopen checkout (enrollment stays pending). */
+export async function expireStaleTransferPayments(enrollmentId?: number): Promise<number> {
+  const params: unknown[] = [];
+  let enrollmentFilter = "";
+  if (enrollmentId != null && Number.isFinite(enrollmentId) && enrollmentId > 0) {
+    enrollmentFilter = " AND enrollment_id = ?";
+    params.push(enrollmentId);
+  }
+  const [stale] = await db().query<RowDataPacket[]>(
+    `SELECT id, enrollment_id FROM payments
+      WHERE method = 'transfer'
+        AND status = 'processing'
+        AND transfer_expires_at IS NOT NULL
+        AND transfer_expires_at < NOW()
+        ${enrollmentFilter}`,
+    params,
+  );
+  if (!stale.length) return 0;
+  const paymentIds = stale.map((row) => Number(row.id));
+  const enrollmentIds = [
+    ...new Set(stale.map((row) => Number(row.enrollment_id)).filter((id) => Number.isFinite(id) && id > 0)),
+  ];
+  await db().execute(
+    `UPDATE payments
+        SET status = 'failed',
+            rejected_at = COALESCE(rejected_at, NOW()),
+            reject_reason = COALESCE(NULLIF(reject_reason, ''), 'expired'),
+            updated_at = CURRENT_TIMESTAMP
+      WHERE id IN (${paymentIds.map(() => "?").join(",")})`,
+    paymentIds,
+  );
+  if (enrollmentIds.length) {
+    await db().execute(
+      `UPDATE enrollments
+          SET payment_method = NULL
+        WHERE id IN (${enrollmentIds.map(() => "?").join(",")})
+          AND status = 'pending'
+          AND payment_method = 'transfer'`,
+      enrollmentIds,
+    );
+  }
+  return paymentIds.length;
+}
+
+async function cancelActiveTransferForEnrollment(
+  enrollmentId: number,
+  reason: string,
+): Promise<void> {
+  await db().execute(
+    `UPDATE payments
+        SET status = 'failed',
+            rejected_at = COALESCE(rejected_at, NOW()),
+            reject_reason = ?,
+            updated_at = CURRENT_TIMESTAMP
+      WHERE enrollment_id = ?
+        AND method = 'transfer'
+        AND status = 'processing'`,
+    [reason.slice(0, 400), enrollmentId],
+  );
+  await db().execute(
+    `UPDATE enrollments
+        SET payment_method = NULL
+      WHERE id = ? AND status = 'pending' AND payment_method = 'transfer'`,
+    [enrollmentId],
+  );
+}
+
+export async function confirmTransferPayment(input: {
+  paymentId: number;
+  adminId: number;
+}): Promise<{ newlyPaid: boolean; enrollmentId: number } | null> {
+  await expireStaleTransferPayments();
+  const [rows] = await db().query<RowDataPacket[]>(
+    `SELECT p.*, e.status AS enrollment_status
+       FROM payments p
+       JOIN enrollments e ON e.id = p.enrollment_id
+      WHERE p.id = ? AND p.method = 'transfer' LIMIT 1`,
+    [input.paymentId],
+  );
+  const payment = rows[0];
+  if (!payment) return null;
+  if (payment.status === "succeeded") {
+    return { newlyPaid: false, enrollmentId: Number(payment.enrollment_id) };
+  }
+  if (payment.status !== "processing") return null;
+  if (
+    payment.enrollment_status === "cancelled" ||
+    payment.enrollment_status === "no_show"
+  ) {
+    return null;
+  }
+  if (payment.transfer_expires_at && new Date(payment.transfer_expires_at).getTime() < Date.now()) {
+    await expireStaleTransferPayments(Number(payment.enrollment_id));
+    return null;
+  }
+
+  await db().execute(
+    `UPDATE payments
+        SET confirmed_by_admin_id = ?,
+            confirmed_at = NOW(),
+            rejected_at = NULL,
+            reject_reason = NULL,
+            updated_at = CURRENT_TIMESTAMP
+      WHERE id = ?`,
+    [input.adminId, input.paymentId],
+  );
+
+  const paid = await markEnrollmentPaid({
+    enrollmentId: Number(payment.enrollment_id),
+    checkoutSessionId: payment.stripe_checkout_session_id
+      ? String(payment.stripe_checkout_session_id)
+      : null,
+    paymentIntentId: null,
+    brand: null,
+    last4: null,
+    method: "transfer",
+    paymentId: input.paymentId,
+  });
+  return { newlyPaid: paid.newlyPaid, enrollmentId: Number(payment.enrollment_id) };
+}
+
+export async function rejectTransferPayment(input: {
+  paymentId: number;
+  reason?: string | null;
+}): Promise<{ ok: true; enrollmentId: number } | null> {
+  await expireStaleTransferPayments();
+  const [rows] = await db().query<RowDataPacket[]>(
+    "SELECT id, enrollment_id, status FROM payments WHERE id = ? AND method = 'transfer' LIMIT 1",
+    [input.paymentId],
+  );
+  const payment = rows[0];
+  if (!payment) return null;
+  if (payment.status === "failed") {
+    return { ok: true, enrollmentId: Number(payment.enrollment_id) };
+  }
+  if (payment.status !== "processing") return null;
+
+  const reason = (input.reason || "rejected").trim().slice(0, 400) || "rejected";
+  await db().execute(
+    `UPDATE payments
+        SET status = 'failed',
+            rejected_at = NOW(),
+            reject_reason = ?,
+            updated_at = CURRENT_TIMESTAMP
+      WHERE id = ?`,
+    [reason, input.paymentId],
+  );
+  await db().execute(
+    `UPDATE enrollments
+        SET payment_method = NULL
+      WHERE id = ? AND status = 'pending' AND payment_method = 'transfer'`,
+    [payment.enrollment_id],
+  );
+  return { ok: true, enrollmentId: Number(payment.enrollment_id) };
 }
 
 function buildApp(): Express {
@@ -1128,13 +2123,18 @@ function buildApp(): Express {
           }
         } else if (enrollmentId && event.type === "checkout.session.completed" && session.payment_status === "unpaid") {
           // OXXO voucher issued — keep seat pending until cash is paid.
-          await db().execute(
-            "UPDATE payments SET method = 'oxxo', status = 'processing' WHERE stripe_checkout_session_id = ?",
-            [session.id],
-          );
-          await db().execute("UPDATE enrollments SET payment_method = 'oxxo' WHERE id = ? AND status = 'pending'", [
-            enrollmentId,
-          ]);
+          await markEnrollmentPendingOxxo({ enrollmentId, checkoutSessionId: session.id });
+          try {
+            let full: Stripe.Checkout.Session = session;
+            try {
+              full = await stripe.checkout.sessions.retrieve(session.id, { expand: ["payment_intent"] });
+            } catch (error) {
+              console.warn("oxxo voucher expand", error);
+            }
+            await sendOxxoVoucherEmail({ enrollmentId, checkoutSessionId: session.id, session: full });
+          } catch (error) {
+            console.error("oxxo voucher email", error);
+          }
         }
       } else if (event.type === "checkout.session.async_payment_failed") {
         const session = event.data.object as Stripe.Checkout.Session;
@@ -1495,6 +2495,9 @@ function buildApp(): Express {
         status: row.status as EnrollmentStatus,
         amountCents: Number(row.amount_cents),
         currency: row.currency,
+        listAmountCents: row.list_amount_cents == null ? null : Number(row.list_amount_cents),
+        discountCents: Number(row.discount_cents || 0),
+        couponId: row.coupon_id == null ? null : Number(row.coupon_id),
         paymentMethod: row.payment_method,
         cardBrand: row.card_brand,
         cardLast4: row.card_last4,
@@ -1563,10 +2566,12 @@ function buildApp(): Express {
           `UPDATE enrollments
               SET status = 'pending', amount_cents = ?, currency = ?,
                   payment_method = NULL, card_brand = NULL, card_last4 = NULL,
-                  stripe_checkout_session_id = NULL, stripe_payment_intent_id = NULL, paid_at = NULL
+                  stripe_checkout_session_id = NULL, stripe_payment_intent_id = NULL, paid_at = NULL,
+                  coupon_id = NULL, list_amount_cents = NULL, discount_cents = 0
             WHERE id = ?`,
           [edition.price_cents, edition.currency, existing.id],
         );
+        await releaseCouponRedemption(Number(existing.id));
         return res.json({ enrollmentId: Number(existing.id), resumed: true });
       }
 
@@ -1596,12 +2601,18 @@ function buildApp(): Express {
   });
 
   app.post("/api/portal/checkout", requireUser, async (req, res) => {
-    const parsed = z.object({ enrollmentId: z.number().int().positive() }).safeParse(req.body);
+    const parsed = z
+      .object({
+        enrollmentId: z.number().int().positive(),
+        /** When true, cancel an active SPEI hold so card/OXXO checkout can start. */
+        preferStripe: z.boolean().optional(),
+      })
+      .safeParse(req.body);
     if (!parsed.success) return res.status(400).json({ error: "Choose a seat to pay." });
-    const stripe = stripeClient();
-    if (!stripe) return res.status(503).json({ error: "Card payments are not configured yet." });
     const user = (req as AuthedRequest).user as UserProfile;
     try {
+      await expireStaleTransferPayments(parsed.data.enrollmentId);
+      await expireStaleCouponHolds(parsed.data.enrollmentId);
       const [rows] = await db().query<RowDataPacket[]>(
         `SELECT e.*, c.title, u.preferred_language
            FROM enrollments e
@@ -1619,6 +2630,59 @@ function buildApp(): Express {
       if (enrollment.status === "cancelled" || enrollment.status === "no_show") {
         return res.status(409).json({ error: "This seat is no longer available.", code: "seat_unavailable" });
       }
+      if (Number(enrollment.amount_cents) <= 0) {
+        return res.status(409).json({
+          error: "This seat is free with your coupon. Confirm it without card or transfer.",
+          code: "coupon_free",
+        });
+      }
+
+      const language: AppLanguage = enrollment.preferred_language === "en" ? "en" : "es";
+      const settings = await loadBankTransferSettings();
+
+      // Active SPEI hold: return instructions unless the learner explicitly switches to Stripe.
+      const [activeTransferRows] = await db().query<RowDataPacket[]>(
+        `SELECT id, transfer_reference, transfer_expires_at, amount_cents, currency
+           FROM payments
+          WHERE enrollment_id = ? AND method = 'transfer' AND status = 'processing'
+          ORDER BY id DESC LIMIT 1`,
+        [enrollment.id],
+      );
+      const activeTransfer = activeTransferRows[0];
+      if (activeTransfer && !parsed.data.preferStripe) {
+        if (!settings) {
+          return res.status(503).json({ error: "Bank transfer is not configured yet." });
+        }
+        return res.json(
+          transferInstructionsPayload({
+            enrollmentId: Number(enrollment.id),
+            paymentId: Number(activeTransfer.id),
+            reference: String(activeTransfer.transfer_reference || transferReferenceFor(Number(enrollment.id))),
+            expiresAt: iso(activeTransfer.transfer_expires_at),
+            amountCents: Number(activeTransfer.amount_cents || enrollment.amount_cents),
+            currency: String(activeTransfer.currency || enrollment.currency || "MXN"),
+            settings,
+            language,
+          }),
+        );
+      }
+      if (activeTransfer && parsed.data.preferStripe) {
+        await cancelActiveTransferForEnrollment(Number(enrollment.id), "switched_to_stripe");
+      }
+
+      // OXXO voucher already issued: under VITEST (no Stripe) report pending_oxxo.
+      // In production we mint a fresh Checkout Session below so payment methods stay available.
+      const stripe = stripeClient();
+      if (!stripe) {
+        if (enrollment.payment_method === "oxxo" && enrollment.status === "pending") {
+          return res.json({
+            status: "pending_oxxo",
+            enrollmentId: Number(enrollment.id),
+            sessionId: enrollment.stripe_checkout_session_id || null,
+          });
+        }
+        return res.status(503).json({ error: "Card payments are not configured yet." });
+      }
 
       // Refresh-safe: reuse an open session only if it already exposes card + OXXO
       // and redirects back to this same site origin (avoids prod return_url while on localhost).
@@ -1629,11 +2693,24 @@ function buildApp(): Express {
           const methods = existing.payment_method_types || [];
           const hasCardAndOxxo = methods.includes("card") && methods.includes("oxxo");
           const returnUrl = String(existing.return_url || "");
-          const sameOrigin = returnUrl.startsWith(`${siteOrigin}/cuenta/exito`);
-          if (existing.status === "open" && existing.client_secret && hasCardAndOxxo && sameOrigin) {
+          const sameOrigin =
+            returnUrl.startsWith(`${siteOrigin}/cuenta/pagar/`) ||
+            returnUrl.startsWith(`${siteOrigin}/cuenta/exito`);
+
+          // Prior OXXO voucher (complete + unpaid): keep the payment row, unlock the seat,
+          // and fall through to create a new open session so card/OXXO UI can render again.
+          if (existing.status === "complete" && existing.payment_status === "unpaid") {
+            await markEnrollmentPendingOxxo({
+              enrollmentId: Number(enrollment.id),
+              checkoutSessionId: existing.id,
+            });
+            await db().execute(
+              "UPDATE enrollments SET payment_method = NULL WHERE id = ? AND status = 'pending'",
+              [enrollment.id],
+            );
+          } else if (existing.status === "open" && existing.client_secret && hasCardAndOxxo && sameOrigin) {
             return res.json({ clientSecret: existing.client_secret, sessionId: existing.id, reused: true });
-          }
-          if (existing.status === "open") {
+          } else if (existing.status === "open") {
             try {
               await stripe.checkout.sessions.expire(existing.id);
             } catch (expireError) {
@@ -1645,7 +2722,17 @@ function buildApp(): Express {
         }
       }
 
+      // Seat was flagged OXXO from a prior voucher — clear the lock before minting a new session.
+      if (enrollment.payment_method === "oxxo") {
+        await db().execute(
+          "UPDATE enrollments SET payment_method = NULL WHERE id = ? AND status = 'pending'",
+          [enrollment.id],
+        );
+      }
+
       const locale = enrollment.preferred_language === "en" ? "en" : "es";
+      // Return to the pay page so closing the OXXO voucher keeps the learner in checkout
+      // (card success still confirms via session_id and navigates to /cuenta/exito).
       const session = await stripe.checkout.sessions.create({
         mode: "payment",
         ui_mode: "elements",
@@ -1671,7 +2758,7 @@ function buildApp(): Express {
           edition_id: String(enrollment.edition_id),
           user_id: String(user.id),
         },
-        return_url: `${siteOrigin}/cuenta/exito?paid=${enrollment.id}&session_id={CHECKOUT_SESSION_ID}`,
+        return_url: `${siteOrigin}/cuenta/pagar/${enrollment.id}?session_id={CHECKOUT_SESSION_ID}`,
         integration_identifier: `domina_checkout_${randomLetters(8)}`,
       });
 
@@ -1726,18 +2813,63 @@ function buildApp(): Express {
       return res.status(400).json({ error: "Invalid enrollment." });
     }
     const user = (req as AuthedRequest).user as UserProfile;
+    await expireStaleTransferPayments(enrollmentId);
+    await expireStaleCouponHolds(enrollmentId);
     const [rows] = await db().query<RowDataPacket[]>(
       `SELECT e.*, c.title, c.slug, c.promise, cat.slug AS category, c.cover_image_url,
-              ed.starts_at, ed.ends_at, ed.venue_name, ed.city, ed.status AS edition_status
+              ed.starts_at, ed.ends_at, ed.venue_name, ed.city, ed.status AS edition_status,
+              u.preferred_language,
+              cp.code AS coupon_code, cp.name AS coupon_name, cp.discount_type AS coupon_discount_type,
+              cp.percent_off AS coupon_percent_off, cp.amount_off_cents AS coupon_amount_off_cents
          FROM enrollments e
          JOIN course_editions ed ON ed.id = e.edition_id
          JOIN courses c ON c.id = ed.course_id
          JOIN course_categories cat ON cat.id = c.category_id
+         JOIN users u ON u.id = e.user_id
+         LEFT JOIN coupons cp ON cp.id = e.coupon_id
         WHERE e.id = ? AND e.user_id = ? LIMIT 1`,
       [enrollmentId, user.id],
     );
     if (!rows[0]) return res.status(404).json({ error: "That seat was not found." });
     const row = rows[0];
+    let transfer: ReturnType<typeof transferInstructionsPayload> | null = null;
+    if (row.payment_method === "transfer" && row.status === "pending" && Number(row.amount_cents) > 0) {
+      const settings = await loadBankTransferSettings();
+      const [transferRows] = await db().query<RowDataPacket[]>(
+        `SELECT id, transfer_reference, transfer_expires_at, amount_cents, currency
+           FROM payments
+          WHERE enrollment_id = ? AND method = 'transfer' AND status = 'processing'
+          ORDER BY id DESC LIMIT 1`,
+        [enrollmentId],
+      );
+      if (settings && transferRows[0]) {
+        const language: AppLanguage = row.preferred_language === "en" ? "en" : "es";
+        transfer = transferInstructionsPayload({
+          enrollmentId,
+          paymentId: Number(transferRows[0].id),
+          reference: String(transferRows[0].transfer_reference || transferReferenceFor(enrollmentId)),
+          expiresAt: iso(transferRows[0].transfer_expires_at),
+          amountCents: Number(transferRows[0].amount_cents || row.amount_cents),
+          currency: String(transferRows[0].currency || row.currency || "MXN"),
+          settings,
+          language,
+        });
+      }
+    }
+    const coupon =
+      row.coupon_id == null
+        ? null
+        : couponSummaryFromRows(
+            {
+              id: row.coupon_id,
+              code: row.coupon_code,
+              name: row.coupon_name,
+              discount_type: row.coupon_discount_type,
+              percent_off: row.coupon_percent_off,
+              amount_off_cents: row.coupon_amount_off_cents,
+            },
+            row,
+          );
     res.json({
       enrollment: {
         id: Number(row.id),
@@ -1745,6 +2877,10 @@ function buildApp(): Express {
         status: row.status as EnrollmentStatus,
         amountCents: Number(row.amount_cents),
         currency: row.currency,
+        listAmountCents: row.list_amount_cents == null ? null : Number(row.list_amount_cents),
+        discountCents: Number(row.discount_cents || 0),
+        couponId: row.coupon_id == null ? null : Number(row.coupon_id),
+        coupon,
         paymentMethod: row.payment_method,
         cardBrand: row.card_brand,
         cardLast4: row.card_last4,
@@ -1758,6 +2894,7 @@ function buildApp(): Express {
         venueName: row.venue_name,
         city: row.city,
         editionStatus: row.edition_status,
+        transfer,
       },
     });
   });
@@ -1784,14 +2921,46 @@ function buildApp(): Express {
 
     // OXXO: voucher created, cash still pending at the store.
     if (session.status === "complete" && session.payment_status === "unpaid") {
-      await db().execute(
-        "UPDATE payments SET method = 'oxxo', status = 'processing' WHERE stripe_checkout_session_id = ?",
-        [session.id],
-      );
-      await db().execute("UPDATE enrollments SET payment_method = 'oxxo' WHERE id = ? AND status = 'pending'", [
+      await markEnrollmentPendingOxxo({ enrollmentId, checkoutSessionId: session.id });
+      let voucherPayload: {
+        url: string;
+        reference: string | null;
+        expiresAt: number | null;
+        amountCents: number;
+        currency: string;
+        courseTitle: string;
+      } | null = null;
+      try {
+        const expanded = await stripe.checkout.sessions.retrieve(session.id, { expand: ["payment_intent"] });
+        const details = await resolveOxxoVoucherDetails(stripe, session.id, expanded);
+        const [enrollRows] = await db().query<RowDataPacket[]>(
+          `SELECT e.amount_cents, e.currency, c.title
+             FROM enrollments e
+             JOIN course_editions ed ON ed.id = e.edition_id
+             JOIN courses c ON c.id = ed.course_id
+            WHERE e.id = ? LIMIT 1`,
+          [enrollmentId],
+        );
+        if (details?.voucherUrl && enrollRows[0]) {
+          voucherPayload = {
+            url: details.voucherUrl,
+            reference: details.reference,
+            expiresAt: details.expiresAt,
+            amountCents: Number(enrollRows[0].amount_cents || 0),
+            currency: String(enrollRows[0].currency || "MXN"),
+            courseTitle: String(enrollRows[0].title || ""),
+          };
+        }
+        await sendOxxoVoucherEmail({ enrollmentId, checkoutSessionId: session.id, session: expanded });
+      } catch (error) {
+        console.error("oxxo voucher email", error);
+      }
+      return res.json({
+        status: "pending_oxxo",
         enrollmentId,
-      ]);
-      return res.json({ status: "pending_oxxo", enrollmentId });
+        sessionId: session.id,
+        voucher: voucherPayload,
+      });
     }
 
     if (session.payment_status !== "paid") {
@@ -1822,6 +2991,581 @@ function buildApp(): Express {
     res.json({ status: "paid", enrollmentId });
   });
 
+  app.post("/api/portal/checkout/oxxo-email", requireUser, async (req, res) => {
+    const parsed = z
+      .object({
+        enrollmentId: z.number().int().positive(),
+        sessionId: z.string().trim().min(8).max(255).optional(),
+      })
+      .safeParse(req.body);
+    if (!parsed.success) return res.status(400).json({ error: "Choose a seat with an OXXO voucher." });
+    const user = (req as AuthedRequest).user as UserProfile;
+
+    const [enrollmentRows] = await db().query<RowDataPacket[]>(
+      "SELECT id, status FROM enrollments WHERE id = ? AND user_id = ? LIMIT 1",
+      [parsed.data.enrollmentId, user.id],
+    );
+    if (!enrollmentRows[0]) return res.status(404).json({ error: "That seat was not found." });
+    if (enrollmentRows[0].status === "paid" || enrollmentRows[0].status === "attended") {
+      return res.status(409).json({ error: "This seat is already paid.", code: "already_paid" });
+    }
+
+    let checkoutSessionId = parsed.data.sessionId || null;
+    if (!checkoutSessionId) {
+      const [paymentRows] = await db().query<RowDataPacket[]>(
+        `SELECT stripe_checkout_session_id FROM payments
+          WHERE enrollment_id = ? AND method = 'oxxo' AND status = 'processing'
+          ORDER BY id DESC LIMIT 1`,
+        [parsed.data.enrollmentId],
+      );
+      checkoutSessionId = paymentRows[0]?.stripe_checkout_session_id
+        ? String(paymentRows[0].stripe_checkout_session_id)
+        : null;
+    }
+    if (!checkoutSessionId) {
+      return res.status(409).json({ error: "No OXXO voucher found for this seat.", code: "oxxo_missing" });
+    }
+
+    try {
+      const result = await sendOxxoVoucherEmail({
+        enrollmentId: parsed.data.enrollmentId,
+        checkoutSessionId,
+      });
+      if (!result.sent && result.reason === "no_voucher_url" && process.env.VITEST !== "true") {
+        return res.status(502).json({ error: "Could not load the OXXO voucher from Stripe yet." });
+      }
+      return res.json({
+        ok: true,
+        skipped: result.skipped,
+        sessionId: checkoutSessionId,
+      });
+    } catch (error) {
+      console.error("oxxo email route", error);
+      return res.status(502).json({ error: "Could not send the OXXO voucher email." });
+    }
+  });
+
+  app.post("/api/portal/checkout/oxxo-voucher", requireUser, async (req, res) => {
+    const parsed = z
+      .object({
+        enrollmentId: z.number().int().positive(),
+        sessionId: z.string().trim().min(8).max(255).optional(),
+      })
+      .safeParse(req.body);
+    if (!parsed.success) return res.status(400).json({ error: "Choose a seat with an OXXO voucher." });
+    const user = (req as AuthedRequest).user as UserProfile;
+
+    const [enrollmentRows] = await db().query<RowDataPacket[]>(
+      `SELECT e.id, e.status, e.amount_cents, e.currency, c.title
+         FROM enrollments e
+         JOIN course_editions ed ON ed.id = e.edition_id
+         JOIN courses c ON c.id = ed.course_id
+        WHERE e.id = ? AND e.user_id = ? LIMIT 1`,
+      [parsed.data.enrollmentId, user.id],
+    );
+    if (!enrollmentRows[0]) return res.status(404).json({ error: "That seat was not found." });
+    if (enrollmentRows[0].status === "paid" || enrollmentRows[0].status === "attended") {
+      return res.status(409).json({ error: "This seat is already paid.", code: "already_paid" });
+    }
+
+    let checkoutSessionId = parsed.data.sessionId || null;
+    if (!checkoutSessionId) {
+      const [paymentRows] = await db().query<RowDataPacket[]>(
+        `SELECT stripe_checkout_session_id FROM payments
+          WHERE enrollment_id = ? AND method = 'oxxo' AND status = 'processing'
+          ORDER BY id DESC LIMIT 1`,
+        [parsed.data.enrollmentId],
+      );
+      checkoutSessionId = paymentRows[0]?.stripe_checkout_session_id
+        ? String(paymentRows[0].stripe_checkout_session_id)
+        : null;
+    }
+    if (!checkoutSessionId) {
+      return res.status(409).json({ error: "No OXXO voucher found for this seat.", code: "oxxo_missing" });
+    }
+
+    if (process.env.VITEST === "true" || !stripeClient()) {
+      return res.json({
+        sessionId: checkoutSessionId,
+        voucher: {
+          url: `https://payments.stripe.com/oxxo/voucher/test_${checkoutSessionId}`,
+          reference: "1234 5678 9012 3465 7890 1234 5678 9012",
+          expiresAt: Math.floor(Date.now() / 1000) + 3 * 86400,
+          amountCents: Number(enrollmentRows[0].amount_cents || 0),
+          currency: String(enrollmentRows[0].currency || "MXN"),
+          courseTitle: String(enrollmentRows[0].title || ""),
+        },
+      });
+    }
+
+    try {
+      const stripe = stripeClient()!;
+      const details = await resolveOxxoVoucherDetails(stripe, checkoutSessionId);
+      if (!details?.voucherUrl) {
+        return res.status(502).json({ error: "Could not load the OXXO voucher from Stripe yet." });
+      }
+      return res.json({
+        sessionId: checkoutSessionId,
+        voucher: {
+          url: details.voucherUrl,
+          reference: details.reference,
+          expiresAt: details.expiresAt,
+          amountCents: Number(enrollmentRows[0].amount_cents || 0),
+          currency: String(enrollmentRows[0].currency || "MXN"),
+          courseTitle: String(enrollmentRows[0].title || ""),
+        },
+      });
+    } catch (error) {
+      console.error("oxxo voucher route", error);
+      return res.status(502).json({ error: "Could not load the OXXO voucher." });
+    }
+  });
+
+  app.post("/api/portal/checkout/transfer", requireUser, async (req, res) => {
+    const parsed = z.object({ enrollmentId: z.number().int().positive() }).safeParse(req.body);
+    if (!parsed.success) return res.status(400).json({ error: "Choose a seat to pay by transfer." });
+    const user = (req as AuthedRequest).user as UserProfile;
+    try {
+      await expireStaleTransferPayments(parsed.data.enrollmentId);
+      const settings = await loadBankTransferSettings();
+      if (!settings || !settings.isEnabled) {
+        return res.status(503).json({ error: "Bank transfer is not available right now.", code: "transfer_disabled" });
+      }
+
+      const [rows] = await db().query<RowDataPacket[]>(
+        `SELECT e.*, u.preferred_language
+           FROM enrollments e
+           JOIN users u ON u.id = e.user_id
+          WHERE e.id = ? AND e.user_id = ? LIMIT 1`,
+        [parsed.data.enrollmentId, user.id],
+      );
+      const enrollment = rows[0];
+      if (!enrollment) return res.status(404).json({ error: "That seat was not found." });
+      if (enrollment.status === "paid" || enrollment.status === "attended") {
+        return res.status(409).json({ error: "This seat is already paid.", code: "already_paid" });
+      }
+      if (enrollment.status === "cancelled" || enrollment.status === "no_show") {
+        return res.status(409).json({ error: "This seat is no longer available.", code: "seat_unavailable" });
+      }
+      if (Number(enrollment.amount_cents) <= 0) {
+        return res.status(409).json({
+          error: "This seat is free with your coupon. Confirm it without transfer.",
+          code: "coupon_free",
+        });
+      }
+
+      const language: AppLanguage = enrollment.preferred_language === "en" ? "en" : "es";
+      const reference = transferReferenceFor(Number(enrollment.id));
+
+      const [existing] = await db().query<RowDataPacket[]>(
+        `SELECT id, transfer_reference, transfer_expires_at, amount_cents, currency
+           FROM payments
+          WHERE enrollment_id = ? AND method = 'transfer' AND status = 'processing'
+          ORDER BY id DESC LIMIT 1`,
+        [enrollment.id],
+      );
+      if (existing[0]) {
+        await db().execute(
+          "UPDATE enrollments SET payment_method = 'transfer' WHERE id = ? AND status = 'pending'",
+          [enrollment.id],
+        );
+        return res.json(
+          transferInstructionsPayload({
+            enrollmentId: Number(enrollment.id),
+            paymentId: Number(existing[0].id),
+            reference: String(existing[0].transfer_reference || reference),
+            expiresAt: iso(existing[0].transfer_expires_at),
+            amountCents: Number(existing[0].amount_cents || enrollment.amount_cents),
+            currency: String(existing[0].currency || enrollment.currency || "MXN"),
+            settings,
+            language,
+          }),
+        );
+      }
+
+      // Expire open Stripe sessions so the learner is not charged twice.
+      const stripe = stripeClient();
+      if (stripe && enrollment.stripe_checkout_session_id) {
+        try {
+          const session = await stripe.checkout.sessions.retrieve(String(enrollment.stripe_checkout_session_id));
+          if (session.status === "open") {
+            await stripe.checkout.sessions.expire(session.id);
+          }
+        } catch (error) {
+          console.warn("stripe expire before transfer", error);
+        }
+      }
+
+      // Supersede prior card/OXXO holds — keep their stripe_checkout_session_id on a failed row
+      // so a late OXXO cash webhook cannot fulfill after the learner switched to SPEI.
+      await db().execute(
+        `UPDATE payments
+            SET status = 'failed',
+                rejected_at = COALESCE(rejected_at, NOW()),
+                reject_reason = 'switched_to_transfer',
+                updated_at = CURRENT_TIMESTAMP
+          WHERE enrollment_id = ?
+            AND status IN ('requires_payment', 'processing')
+            AND method <> 'transfer'`,
+        [enrollment.id],
+      );
+
+      const expiresAt = new Date(Date.now() + settings.expiresAfterDays * 86400000);
+      const [openTransfer] = await db().query<RowDataPacket[]>(
+        `SELECT id FROM payments
+          WHERE enrollment_id = ? AND method = 'transfer' AND status = 'processing'
+          ORDER BY id DESC LIMIT 1`,
+        [enrollment.id],
+      );
+
+      let paymentId: number;
+      if (openTransfer[0]) {
+        paymentId = Number(openTransfer[0].id);
+        await db().execute(
+          `UPDATE payments
+              SET transfer_reference = ?,
+                  transfer_expires_at = ?,
+                  updated_at = CURRENT_TIMESTAMP
+            WHERE id = ?`,
+          [reference, expiresAt, paymentId],
+        );
+      } else {
+        const [inserted] = await db().execute<ResultSetHeader>(
+          `INSERT INTO payments (
+             enrollment_id, user_id, edition_id, amount_cents, currency, status, method,
+             transfer_reference, transfer_expires_at
+           ) VALUES (?, ?, ?, ?, ?, 'processing', 'transfer', ?, ?)`,
+          [
+            enrollment.id,
+            user.id,
+            enrollment.edition_id,
+            enrollment.amount_cents,
+            enrollment.currency,
+            reference,
+            expiresAt,
+          ],
+        );
+        paymentId = Number(inserted.insertId);
+      }
+
+      await db().execute(
+        `UPDATE enrollments
+            SET payment_method = 'transfer', stripe_checkout_session_id = NULL
+          WHERE id = ? AND status = 'pending'`,
+        [enrollment.id],
+      );
+
+      return res.json(
+        transferInstructionsPayload({
+          enrollmentId: Number(enrollment.id),
+          paymentId,
+          reference,
+          expiresAt: iso(expiresAt),
+          amountCents: Number(enrollment.amount_cents),
+          currency: String(enrollment.currency || "MXN"),
+          settings,
+          language,
+        }),
+      );
+    } catch (error) {
+      sendDbError(res, error as { code?: string; message?: string });
+    }
+  });
+
+  app.post("/api/portal/checkout/coupon", requireUser, async (req, res) => {
+    const parsed = z
+      .object({
+        enrollmentId: z.number().int().positive(),
+        code: z.string().trim().min(2).max(40),
+      })
+      .safeParse(req.body);
+    if (!parsed.success) return res.status(400).json({ error: "Enter a coupon code.", code: "coupon_required" });
+    const user = (req as AuthedRequest).user as UserProfile;
+    const code = normalizeCouponCode(parsed.data.code);
+    if (!/^[A-Z0-9_-]{2,40}$/.test(code)) {
+      return res.status(400).json({ error: "That coupon code looks invalid.", code: "coupon_invalid" });
+    }
+    let conn: PoolConnection | null = null;
+    try {
+      await expireStaleCouponHolds(parsed.data.enrollmentId);
+      const [rows] = await db().query<RowDataPacket[]>(
+        `SELECT e.*, ed.course_id, ed.price_cents AS edition_price_cents, c.title
+           FROM enrollments e
+           JOIN course_editions ed ON ed.id = e.edition_id
+           JOIN courses c ON c.id = ed.course_id
+          WHERE e.id = ? AND e.user_id = ? LIMIT 1`,
+        [parsed.data.enrollmentId, user.id],
+      );
+      const enrollment = rows[0];
+      if (!enrollment) return res.status(404).json({ error: "That seat was not found." });
+      if (enrollment.status === "paid" || enrollment.status === "attended") {
+        return res.status(409).json({ error: "This seat is already paid.", code: "already_paid" });
+      }
+      if (enrollment.status === "cancelled" || enrollment.status === "no_show") {
+        return res.status(409).json({ error: "This seat is no longer available.", code: "seat_unavailable" });
+      }
+
+      // Invalidate open Stripe/SPEI outside the coupon lock (Stripe I/O).
+      await invalidateOpenCheckoutForEnrollment(Number(enrollment.id), "coupon_applied");
+
+      conn = await db().getConnection();
+      await conn.beginTransaction();
+      const coupon = await loadCouponForApply(code, conn, true);
+      if (!coupon) {
+        await conn.rollback();
+        return res.status(404).json({ error: "That coupon was not found.", code: "coupon_not_found" });
+      }
+
+      const listAmountCents = Number(
+        enrollment.list_amount_cents ?? enrollment.edition_price_cents ?? enrollment.amount_cents,
+      );
+      const validated = await validateCouponForEnrollment(
+        {
+          coupon,
+          enrollmentId: Number(enrollment.id),
+          userId: user.id,
+          courseId: Number(enrollment.course_id),
+          editionId: Number(enrollment.edition_id),
+          listAmountCents,
+        },
+        conn,
+      );
+      if ("status" in validated) {
+        await conn.rollback();
+        return res.status(validated.status).json({ error: validated.error, code: validated.code });
+      }
+
+      await conn.execute(
+        `UPDATE enrollments
+            SET coupon_id = ?,
+                list_amount_cents = ?,
+                discount_cents = ?,
+                amount_cents = ?,
+                payment_method = NULL,
+                stripe_checkout_session_id = NULL,
+                stripe_payment_intent_id = NULL
+          WHERE id = ? AND status IN ('pending', 'waitlist')`,
+        [
+          coupon.id,
+          listAmountCents,
+          validated.discountCents,
+          validated.finalAmountCents,
+          enrollment.id,
+        ],
+      );
+
+      const [existingRedemption] = await conn.query<RowDataPacket[]>(
+        "SELECT id, status FROM coupon_redemptions WHERE enrollment_id = ? LIMIT 1 FOR UPDATE",
+        [enrollment.id],
+      );
+      if (existingRedemption[0]) {
+        if (existingRedemption[0].status === "consumed") {
+          await conn.rollback();
+          return res.status(409).json({ error: "This seat already used a coupon.", code: "coupon_consumed" });
+        }
+        await conn.execute(
+          `UPDATE coupon_redemptions
+              SET coupon_id = ?, user_id = ?, list_amount_cents = ?, discount_cents = ?,
+                  final_amount_cents = ?, status = 'applied', updated_at = CURRENT_TIMESTAMP,
+                  created_at = CURRENT_TIMESTAMP
+            WHERE id = ?`,
+          [
+            coupon.id,
+            user.id,
+            listAmountCents,
+            validated.discountCents,
+            validated.finalAmountCents,
+            existingRedemption[0].id,
+          ],
+        );
+      } else {
+        await conn.execute(
+          `INSERT INTO coupon_redemptions (
+             coupon_id, enrollment_id, user_id, list_amount_cents, discount_cents, final_amount_cents, status
+           ) VALUES (?, ?, ?, ?, ?, ?, 'applied')`,
+          [
+            coupon.id,
+            enrollment.id,
+            user.id,
+            listAmountCents,
+            validated.discountCents,
+            validated.finalAmountCents,
+          ],
+        );
+      }
+
+      await conn.commit();
+      return res.json({
+        enrollmentId: Number(enrollment.id),
+        amountCents: validated.finalAmountCents,
+        listAmountCents,
+        discountCents: validated.discountCents,
+        currency: String(enrollment.currency || "MXN"),
+        free: validated.finalAmountCents <= 0,
+        coupon: {
+          id: Number(coupon.id),
+          code: String(coupon.code),
+          name: String(coupon.name),
+          discountType: coupon.discount_type === "fixed" ? "fixed" : "percent",
+          percentOff: coupon.percent_off == null ? null : Number(coupon.percent_off),
+          amountOffCents: coupon.amount_off_cents == null ? null : Number(coupon.amount_off_cents),
+          listAmountCents,
+          discountCents: validated.discountCents,
+          finalAmountCents: validated.finalAmountCents,
+        },
+      });
+    } catch (error) {
+      if (conn) {
+        try {
+          await conn.rollback();
+        } catch {
+          /* ignore */
+        }
+      }
+      sendDbError(res, error as { code?: string; message?: string });
+    } finally {
+      conn?.release();
+    }
+  });
+
+  app.delete("/api/portal/checkout/coupon", requireUser, async (req, res) => {
+    const parsed = z.object({ enrollmentId: z.number().int().positive() }).safeParse(req.body);
+    if (!parsed.success) return res.status(400).json({ error: "Choose a seat." });
+    const user = (req as AuthedRequest).user as UserProfile;
+    try {
+      const [rows] = await db().query<RowDataPacket[]>(
+        `SELECT e.*, ed.price_cents AS edition_price_cents
+           FROM enrollments e
+           JOIN course_editions ed ON ed.id = e.edition_id
+          WHERE e.id = ? AND e.user_id = ? LIMIT 1`,
+        [parsed.data.enrollmentId, user.id],
+      );
+      const enrollment = rows[0];
+      if (!enrollment) return res.status(404).json({ error: "That seat was not found." });
+      if (enrollment.status === "paid" || enrollment.status === "attended") {
+        return res.status(409).json({ error: "This seat is already paid.", code: "already_paid" });
+      }
+      if (!enrollment.coupon_id) {
+        return res.json({
+          enrollmentId: Number(enrollment.id),
+          amountCents: Number(enrollment.amount_cents),
+          removed: false,
+        });
+      }
+
+      const restoreCents = Number(
+        enrollment.list_amount_cents ?? enrollment.edition_price_cents ?? enrollment.amount_cents,
+      );
+      await invalidateOpenCheckoutForEnrollment(Number(enrollment.id), "coupon_removed");
+      await releaseCouponRedemption(Number(enrollment.id));
+      await db().execute(
+        `UPDATE enrollments
+            SET coupon_id = NULL,
+                list_amount_cents = NULL,
+                discount_cents = 0,
+                amount_cents = ?,
+                payment_method = NULL,
+                stripe_checkout_session_id = NULL,
+                stripe_payment_intent_id = NULL
+          WHERE id = ? AND status IN ('pending', 'waitlist')`,
+        [restoreCents, enrollment.id],
+      );
+      return res.json({
+        enrollmentId: Number(enrollment.id),
+        amountCents: restoreCents,
+        listAmountCents: null,
+        discountCents: 0,
+        coupon: null,
+        removed: true,
+      });
+    } catch (error) {
+      sendDbError(res, error as { code?: string; message?: string });
+    }
+  });
+
+  app.post("/api/portal/checkout/confirm-free", requireUser, async (req, res) => {
+    const parsed = z.object({ enrollmentId: z.number().int().positive() }).safeParse(req.body);
+    if (!parsed.success) return res.status(400).json({ error: "Choose a seat." });
+    const user = (req as AuthedRequest).user as UserProfile;
+    try {
+      await expireStaleCouponHolds(parsed.data.enrollmentId);
+      const [rows] = await db().query<RowDataPacket[]>(
+        `SELECT e.*, ed.course_id, ed.price_cents AS edition_price_cents
+           FROM enrollments e
+           JOIN course_editions ed ON ed.id = e.edition_id
+          WHERE e.id = ? AND e.user_id = ? LIMIT 1`,
+        [parsed.data.enrollmentId, user.id],
+      );
+      const enrollment = rows[0];
+      if (!enrollment) return res.status(404).json({ error: "That seat was not found." });
+      if (enrollment.status === "paid" || enrollment.status === "attended") {
+        return res.status(409).json({ error: "This seat is already paid.", code: "already_paid" });
+      }
+      if (enrollment.status === "cancelled" || enrollment.status === "no_show") {
+        return res.status(409).json({ error: "This seat is no longer available.", code: "seat_unavailable" });
+      }
+      if (!enrollment.coupon_id || Number(enrollment.amount_cents) > 0) {
+        return res.status(409).json({
+          error: "This seat still has a balance to pay.",
+          code: "not_free",
+        });
+      }
+
+      const [couponRows] = await db().query<RowDataPacket[]>(
+        "SELECT * FROM coupons WHERE id = ? LIMIT 1",
+        [enrollment.coupon_id],
+      );
+      const coupon = couponRows[0];
+      if (!coupon) {
+        return res.status(409).json({ error: "That coupon is no longer available.", code: "coupon_inactive" });
+      }
+      const listAmountCents = Number(
+        enrollment.list_amount_cents ?? enrollment.edition_price_cents ?? enrollment.amount_cents,
+      );
+      const validated = await validateCouponForEnrollment({
+        coupon,
+        enrollmentId: Number(enrollment.id),
+        userId: user.id,
+        courseId: Number(enrollment.course_id),
+        editionId: Number(enrollment.edition_id),
+        listAmountCents,
+      });
+      if ("status" in validated) {
+        return res.status(validated.status).json({ error: validated.error, code: validated.code });
+      }
+      if (validated.finalAmountCents > 0) {
+        return res.status(409).json({
+          error: "This seat still has a balance to pay.",
+          code: "not_free",
+        });
+      }
+
+      const paid = await markEnrollmentPaid({
+        enrollmentId: Number(enrollment.id),
+        checkoutSessionId: `coupon_free_${enrollment.id}`,
+        paymentIntentId: null,
+        brand: null,
+        last4: null,
+        method: "coupon",
+      });
+      if (paid.newlyPaid) {
+        try {
+          await sendSeatConfirmationEmail({
+            enrollmentId: Number(enrollment.id),
+            method: "coupon",
+            brand: null,
+            last4: null,
+          });
+        } catch (error) {
+          console.error("coupon free confirmation email", error);
+        }
+      }
+      return res.json({ enrollmentId: Number(enrollment.id), status: "paid", newlyPaid: paid.newlyPaid });
+    } catch (error) {
+      sendDbError(res, error as { code?: string; message?: string });
+    }
+  });
+
   if (process.env.VITEST === "true") {
     app.post("/api/portal/checkout/simulate", requireUser, async (req, res) => {
       const parsed = z
@@ -1829,15 +3573,54 @@ function buildApp(): Express {
           enrollmentId: z.number().int().positive(),
           brand: z.string().max(40).optional(),
           last4: z.string().regex(/^\d{4}$/).optional(),
+          pendingOxxo: z.boolean().optional(),
         })
         .safeParse(req.body);
       if (!parsed.success) return res.status(400).json({ error: "Invalid test payment." });
       const user = (req as AuthedRequest).user as UserProfile;
       const [rows] = await db().query<RowDataPacket[]>(
-        "SELECT id FROM enrollments WHERE id = ? AND user_id = ? LIMIT 1",
+        "SELECT id, edition_id, amount_cents, currency FROM enrollments WHERE id = ? AND user_id = ? LIMIT 1",
         [parsed.data.enrollmentId, user.id],
       );
       if (!rows[0]) return res.status(404).json({ error: "That seat was not found." });
+
+      if (parsed.data.pendingOxxo) {
+        const sessionId = `cs_test_oxxo_${parsed.data.enrollmentId}_${Date.now()}`;
+        const [existingPayments] = await db().query<RowDataPacket[]>(
+          `SELECT id FROM payments
+            WHERE enrollment_id = ? AND status IN ('requires_payment', 'processing')
+            ORDER BY id DESC LIMIT 1`,
+          [parsed.data.enrollmentId],
+        );
+        if (existingPayments[0]) {
+          await db().execute(
+            `UPDATE payments
+                SET stripe_checkout_session_id = ?, status = 'processing', method = 'oxxo', updated_at = CURRENT_TIMESTAMP
+              WHERE id = ?`,
+            [sessionId, existingPayments[0].id],
+          );
+        } else {
+          await db().execute(
+            `INSERT INTO payments (
+               enrollment_id, user_id, edition_id, amount_cents, currency, status, method, stripe_checkout_session_id
+             ) VALUES (?, ?, ?, ?, ?, 'processing', 'oxxo', ?)`,
+            [
+              parsed.data.enrollmentId,
+              user.id,
+              rows[0].edition_id,
+              rows[0].amount_cents,
+              rows[0].currency,
+              sessionId,
+            ],
+          );
+        }
+        await markEnrollmentPendingOxxo({
+          enrollmentId: parsed.data.enrollmentId,
+          checkoutSessionId: sessionId,
+        });
+        return res.json({ ok: true, status: "pending_oxxo", sessionId });
+      }
+
       await markEnrollmentPaid({
         enrollmentId: parsed.data.enrollmentId,
         checkoutSessionId: `vitest_${parsed.data.enrollmentId}_${Date.now()}`,
@@ -2526,6 +4309,9 @@ function buildApp(): Express {
     if (!venue || !(await assertActiveCatalogId("venues", data.venueId))) {
       return res.status(400).json({ error: "Pick an active venue." });
     }
+    if (!(await assertAssignableInstructor(data.instructorAdminId))) {
+      return res.status(400).json({ error: "Pick an active instructor.", code: "instructor_invalid" });
+    }
     const [result] = await db().execute<ResultSetHeader>(
       `INSERT INTO course_editions (
          course_id, instructor_admin_id, venue_id, starts_at, ends_at, venue_name, venue_address, city,
@@ -2567,6 +4353,12 @@ function buildApp(): Express {
       })
       .safeParse(req.body);
     if (!parsed.success) return res.status(400).json({ error: "Check the edition fields." });
+    if (
+      parsed.data.instructorAdminId !== undefined &&
+      !(await assertAssignableInstructor(parsed.data.instructorAdminId))
+    ) {
+      return res.status(400).json({ error: "Pick an active instructor.", code: "instructor_invalid" });
+    }
     const map: Record<string, string> = {
       status: "status",
       capacity: "capacity",
@@ -2692,9 +4484,9 @@ function buildApp(): Express {
     let where = "WHERE 1=1";
     if (q.search) {
       where +=
-        " AND (c.title LIKE ? OR u.email LIKE ? OR u.first_name LIKE ? OR u.last_name LIKE ? OR co.name LIKE ?)";
+        " AND (c.title LIKE ? OR u.email LIKE ? OR u.first_name LIKE ? OR u.last_name LIKE ? OR co.name LIKE ? OR cp.code LIKE ?)";
       const like = `%${q.search}%`;
-      params.push(like, like, like, like, like);
+      params.push(like, like, like, like, like, like);
     }
     const [countRows] = await db().query<RowDataPacket[]>(
       `SELECT COUNT(*) AS total
@@ -2703,17 +4495,22 @@ function buildApp(): Express {
          LEFT JOIN courses c ON c.id = ed.course_id
          LEFT JOIN users u ON u.id = p.user_id
          LEFT JOIN companies co ON co.id = p.company_id
+         LEFT JOIN enrollments e ON e.id = p.enrollment_id
+         LEFT JOIN coupons cp ON cp.id = e.coupon_id
          ${where}`,
       params,
     );
     const total = Number(countRows[0]?.total || 0);
     const [rows] = await db().query<RowDataPacket[]>(
-      `SELECT p.*, c.title AS course_title, u.email, u.first_name, u.last_name, co.name AS company_name
+      `SELECT p.*, c.title AS course_title, u.email, u.first_name, u.last_name, co.name AS company_name,
+              e.discount_cents, e.list_amount_cents, cp.code AS coupon_code
          FROM payments p
          LEFT JOIN course_editions ed ON ed.id = p.edition_id
          LEFT JOIN courses c ON c.id = ed.course_id
          LEFT JOIN users u ON u.id = p.user_id
          LEFT JOIN companies co ON co.id = p.company_id
+         LEFT JOIN enrollments e ON e.id = p.enrollment_id
+         LEFT JOIN coupons cp ON cp.id = e.coupon_id
          ${where}
         ORDER BY ${orderCol} ${q.sortDir}, p.id DESC
         LIMIT ? OFFSET ?`,
@@ -2733,6 +4530,9 @@ function buildApp(): Express {
         firstName: row.first_name,
         lastName: row.last_name,
         companyName: row.company_name,
+        couponCode: row.coupon_code || null,
+        listAmountCents: row.list_amount_cents == null ? null : Number(row.list_amount_cents),
+        discountCents: Number(row.discount_cents || 0),
         createdAt: iso(row.created_at),
       })),
       pagination: paginationOf(q.page, q.limit, total),
@@ -2765,9 +4565,9 @@ function buildApp(): Express {
     }
     if (q.search) {
       where +=
-        " AND (u.email LIKE ? OR u.first_name LIKE ? OR u.last_name LIKE ? OR c.title LIKE ? OR u.phone LIKE ?)";
+        " AND (u.email LIKE ? OR u.first_name LIKE ? OR u.last_name LIKE ? OR c.title LIKE ? OR u.phone LIKE ? OR cp.code LIKE ? OR CAST(e.id AS CHAR) LIKE ?)";
       const like = `%${q.search}%`;
-      params.push(like, like, like, like, like);
+      params.push(like, like, like, like, like, like, like);
     }
     const [countRows] = await db().query<RowDataPacket[]>(
       `SELECT COUNT(*) AS total
@@ -2775,20 +4575,22 @@ function buildApp(): Express {
          JOIN users u ON u.id = e.user_id
          JOIN course_editions ed ON ed.id = e.edition_id
          JOIN courses c ON c.id = ed.course_id
+         LEFT JOIN coupons cp ON cp.id = e.coupon_id
          ${where}`,
       params,
     );
     const total = Number(countRows[0]?.total || 0);
     const [rows] = await db().query<RowDataPacket[]>(
       `SELECT e.id, e.status, e.amount_cents, e.currency, e.payment_method, e.card_brand, e.card_last4,
-              e.paid_at, e.created_at, e.edition_id,
+              e.paid_at, e.created_at, e.edition_id, e.discount_cents, e.list_amount_cents,
               u.first_name, u.last_name, u.email, u.phone, u.audience,
               c.id AS course_id, c.title AS course_title, c.slug AS course_slug,
-              ed.starts_at, ed.city
+              ed.starts_at, ed.city, cp.code AS coupon_code
          FROM enrollments e
          JOIN users u ON u.id = e.user_id
          JOIN course_editions ed ON ed.id = e.edition_id
          JOIN courses c ON c.id = ed.course_id
+         LEFT JOIN coupons cp ON cp.id = e.coupon_id
          ${where}
         ORDER BY ${orderCol} ${q.sortDir}, e.id DESC
         LIMIT ? OFFSET ?`,
@@ -2800,6 +4602,9 @@ function buildApp(): Express {
         status: row.status,
         amountCents: Number(row.amount_cents),
         currency: row.currency,
+        listAmountCents: row.list_amount_cents == null ? null : Number(row.list_amount_cents),
+        discountCents: Number(row.discount_cents || 0),
+        couponCode: row.coupon_code || null,
         paymentMethod: row.payment_method,
         cardBrand: row.card_brand,
         cardLast4: row.card_last4,
@@ -2935,6 +4740,363 @@ function buildApp(): Express {
     }
   });
 
+  const couponBodySchema = z
+    .object({
+      code: z.string().trim().min(2).max(40),
+      name: z.string().trim().min(1).max(120),
+      description: z.string().trim().max(400).optional().nullable(),
+      discountType: z.enum(["percent", "fixed"]),
+      percentOff: z.number().min(0).max(100).optional().nullable(),
+      amountOffCents: z.number().int().min(1).optional().nullable(),
+      scope: z.enum(["all", "course", "edition"]).default("all"),
+      courseIds: z.array(z.number().int().positive()).optional().default([]),
+      editionIds: z.array(z.number().int().positive()).optional().default([]),
+      maxRedemptions: z.number().int().positive().optional().nullable(),
+      startsAt: z.string().trim().min(4).max(40).optional().nullable(),
+      endsAt: z.string().trim().min(4).max(40).optional().nullable(),
+      active: z.boolean().optional().default(true),
+    })
+    .superRefine((value, ctx) => {
+      if (value.discountType === "percent") {
+        if (value.percentOff == null || !Number.isFinite(value.percentOff) || value.percentOff <= 0) {
+          ctx.addIssue({ code: z.ZodIssueCode.custom, message: "percentOff required", path: ["percentOff"] });
+        }
+      }
+      if (value.discountType === "fixed") {
+        if (value.amountOffCents == null || value.amountOffCents < 1) {
+          ctx.addIssue({
+            code: z.ZodIssueCode.custom,
+            message: "amountOffCents required",
+            path: ["amountOffCents"],
+          });
+        }
+      }
+      if (value.scope === "course" && (!value.courseIds || value.courseIds.length < 1)) {
+        ctx.addIssue({ code: z.ZodIssueCode.custom, message: "courseIds required", path: ["courseIds"] });
+      }
+      if (value.scope === "edition" && (!value.editionIds || value.editionIds.length < 1)) {
+        ctx.addIssue({ code: z.ZodIssueCode.custom, message: "editionIds required", path: ["editionIds"] });
+      }
+    });
+
+  const couponPatchSchema = z.object({
+    code: z.string().trim().min(2).max(40).optional(),
+    name: z.string().trim().min(1).max(120).optional(),
+    description: z.string().trim().max(400).optional().nullable(),
+    discountType: z.enum(["percent", "fixed"]).optional(),
+    percentOff: z.number().min(0).max(100).optional().nullable(),
+    amountOffCents: z.number().int().min(1).optional().nullable(),
+    scope: z.enum(["all", "course", "edition"]).optional(),
+    courseIds: z.array(z.number().int().positive()).optional(),
+    editionIds: z.array(z.number().int().positive()).optional(),
+    maxRedemptions: z.number().int().positive().optional().nullable(),
+    startsAt: z.string().trim().min(4).max(40).optional().nullable(),
+    endsAt: z.string().trim().min(4).max(40).optional().nullable(),
+    active: z.boolean().optional(),
+  });
+
+  async function replaceCouponScopes(
+    couponId: number,
+    scope: "all" | "course" | "edition",
+    courseIds: number[],
+    editionIds: number[],
+  ) {
+    await db().execute("DELETE FROM coupon_courses WHERE coupon_id = ?", [couponId]);
+    await db().execute("DELETE FROM coupon_editions WHERE coupon_id = ?", [couponId]);
+    if (scope === "course") {
+      for (const courseId of courseIds) {
+        await db().execute("INSERT INTO coupon_courses (coupon_id, course_id) VALUES (?, ?)", [couponId, courseId]);
+      }
+    }
+    if (scope === "edition") {
+      for (const editionId of editionIds) {
+        await db().execute("INSERT INTO coupon_editions (coupon_id, edition_id) VALUES (?, ?)", [couponId, editionId]);
+      }
+    }
+  }
+
+  async function couponAdminPayload(couponId: number) {
+    const [rows] = await db().query<RowDataPacket[]>("SELECT * FROM coupons WHERE id = ? LIMIT 1", [couponId]);
+    const coupon = rows[0];
+    if (!coupon) return null;
+    const [courseRows] = await db().query<RowDataPacket[]>(
+      "SELECT course_id FROM coupon_courses WHERE coupon_id = ?",
+      [couponId],
+    );
+    const [editionRows] = await db().query<RowDataPacket[]>(
+      "SELECT edition_id FROM coupon_editions WHERE coupon_id = ?",
+      [couponId],
+    );
+    const redemptions = await countActiveCouponHolds(couponId);
+    return {
+      id: Number(coupon.id),
+      code: String(coupon.code),
+      name: String(coupon.name),
+      description: coupon.description || null,
+      discountType: coupon.discount_type === "fixed" ? ("fixed" as const) : ("percent" as const),
+      percentOff: coupon.percent_off == null ? null : Number(coupon.percent_off),
+      amountOffCents: coupon.amount_off_cents == null ? null : Number(coupon.amount_off_cents),
+      currency: String(coupon.currency || "MXN"),
+      scope: String(coupon.scope || "all") as "all" | "course" | "edition",
+      courseIds: courseRows.map((row) => Number(row.course_id)),
+      editionIds: editionRows.map((row) => Number(row.edition_id)),
+      maxRedemptions: coupon.max_redemptions == null ? null : Number(coupon.max_redemptions),
+      redemptionCount: redemptions,
+      startsAt: coupon.starts_at ? iso(coupon.starts_at) : null,
+      endsAt: coupon.ends_at ? iso(coupon.ends_at) : null,
+      active: Boolean(Number(coupon.active)),
+      createdAt: iso(coupon.created_at),
+      updatedAt: iso(coupon.updated_at),
+    };
+  }
+
+  app.get("/api/admin/coupons", requireOpsStaff, async (req, res) => {
+    const admin = (req as AuthedRequest).admin as AdminProfile;
+    if (!canManageCoupons(admin)) {
+      return res.status(403).json({ error: "Only owners and finance can manage coupons." });
+    }
+    const q = parseListQuery(req, { limit: 25 });
+    const sortMap: Record<string, string> = {
+      code: "c.code",
+      name: "c.name",
+      createdAt: "c.created_at",
+      endsAt: "c.ends_at",
+      active: "c.active",
+    };
+    const orderCol = sortMap[q.sortBy] || "c.created_at";
+    const params: unknown[] = [];
+    let where = "WHERE 1=1";
+    if (q.search) {
+      where += " AND (c.code LIKE ? OR c.name LIKE ? OR c.description LIKE ?)";
+      const like = `%${q.search}%`;
+      params.push(like, like, like);
+    }
+    const [countRows] = await db().query<RowDataPacket[]>(
+      `SELECT COUNT(*) AS total FROM coupons c ${where}`,
+      params,
+    );
+    const total = Number(countRows[0]?.total || 0);
+    const [rows] = await db().query<RowDataPacket[]>(
+      `SELECT c.*,
+              (SELECT COUNT(*) FROM coupon_redemptions r
+                WHERE r.coupon_id = c.id AND r.status IN ('applied', 'consumed')) AS redemption_count
+         FROM coupons c
+         ${where}
+        ORDER BY ${orderCol} ${q.sortDir}, c.id DESC
+        LIMIT ? OFFSET ?`,
+      [...params, q.limit, q.offset],
+    );
+    res.json({
+      coupons: rows.map((row) => ({
+        id: Number(row.id),
+        code: String(row.code),
+        name: String(row.name),
+        description: row.description || null,
+        discountType: row.discount_type === "fixed" ? "fixed" : "percent",
+        percentOff: row.percent_off == null ? null : Number(row.percent_off),
+        amountOffCents: row.amount_off_cents == null ? null : Number(row.amount_off_cents),
+        currency: String(row.currency || "MXN"),
+        scope: String(row.scope || "all"),
+        maxRedemptions: row.max_redemptions == null ? null : Number(row.max_redemptions),
+        redemptionCount: Number(row.redemption_count || 0),
+        startsAt: row.starts_at ? iso(row.starts_at) : null,
+        endsAt: row.ends_at ? iso(row.ends_at) : null,
+        active: Boolean(Number(row.active)),
+        createdAt: iso(row.created_at),
+        updatedAt: iso(row.updated_at),
+      })),
+      pagination: paginationOf(q.page, q.limit, total),
+    });
+  });
+
+  app.get("/api/admin/coupons/:id", requireOpsStaff, async (req, res) => {
+    const admin = (req as AuthedRequest).admin as AdminProfile;
+    if (!canManageCoupons(admin)) {
+      return res.status(403).json({ error: "Only owners and finance can manage coupons." });
+    }
+    const couponId = Number(req.params.id);
+    if (!Number.isFinite(couponId) || couponId < 1) {
+      return res.status(400).json({ error: "Invalid coupon." });
+    }
+    const coupon = await couponAdminPayload(couponId);
+    if (!coupon) return res.status(404).json({ error: "That coupon was not found." });
+    res.json({ coupon });
+  });
+
+  app.post("/api/admin/coupons", requireOpsStaff, async (req, res) => {
+    const admin = (req as AuthedRequest).admin as AdminProfile;
+    if (!canManageCoupons(admin)) {
+      return res.status(403).json({ error: "Only owners and finance can manage coupons." });
+    }
+    const parsed = couponBodySchema.safeParse(req.body);
+    if (!parsed.success) return res.status(400).json({ error: "Check the coupon fields." });
+    const data = parsed.data;
+    const code = normalizeCouponCode(data.code);
+    if (!/^[A-Z0-9_-]{2,40}$/.test(code)) {
+      return res.status(400).json({ error: "Use letters, numbers, - or _ in the code." });
+    }
+    try {
+      const [created] = await db().execute<ResultSetHeader>(
+        `INSERT INTO coupons (
+           code, name, description, discount_type, percent_off, amount_off_cents, currency,
+           scope, max_redemptions, starts_at, ends_at, active, created_by_admin_id
+         ) VALUES (?, ?, ?, ?, ?, ?, 'MXN', ?, ?, ?, ?, ?, ?)`,
+        [
+          code,
+          data.name,
+          data.description || null,
+          data.discountType,
+          data.discountType === "percent" ? data.percentOff : null,
+          data.discountType === "fixed" ? data.amountOffCents : null,
+          data.scope,
+          data.maxRedemptions ?? null,
+          data.startsAt ? new Date(data.startsAt) : null,
+          data.endsAt ? new Date(data.endsAt) : null,
+          data.active ? 1 : 0,
+          admin.id,
+        ],
+      );
+      const couponId = Number(created.insertId);
+      await replaceCouponScopes(couponId, data.scope, data.courseIds || [], data.editionIds || []);
+      const coupon = await couponAdminPayload(couponId);
+      res.status(201).json({ coupon });
+    } catch (error) {
+      const err = error as { code?: string };
+      if (err?.code === "ER_DUP_ENTRY") {
+        return res.status(409).json({ error: "That coupon code already exists.", code: "coupon_code_taken" });
+      }
+      sendDbError(res, err);
+    }
+  });
+
+  app.patch("/api/admin/coupons/:id", requireOpsStaff, async (req, res) => {
+    const admin = (req as AuthedRequest).admin as AdminProfile;
+    if (!canManageCoupons(admin)) {
+      return res.status(403).json({ error: "Only owners and finance can manage coupons." });
+    }
+    const couponId = Number(req.params.id);
+    if (!Number.isFinite(couponId) || couponId < 1) {
+      return res.status(400).json({ error: "Invalid coupon." });
+    }
+    const parsed = couponPatchSchema.safeParse(req.body);
+    if (!parsed.success) return res.status(400).json({ error: "Check the coupon fields." });
+    const data = parsed.data;
+    try {
+      const [existingRows] = await db().query<RowDataPacket[]>(
+        "SELECT * FROM coupons WHERE id = ? LIMIT 1",
+        [couponId],
+      );
+      const existing = existingRows[0];
+      if (!existing) return res.status(404).json({ error: "That coupon was not found." });
+
+      const discountType =
+        data.discountType || (existing.discount_type === "fixed" ? "fixed" : "percent");
+      const scope = (data.scope || String(existing.scope || "all")) as "all" | "course" | "edition";
+      const code = data.code != null ? normalizeCouponCode(data.code) : String(existing.code);
+      if (!/^[A-Z0-9_-]{2,40}$/.test(code)) {
+        return res.status(400).json({ error: "Use letters, numbers, - or _ in the code." });
+      }
+
+      const name = data.name ?? String(existing.name);
+      const description = data.description !== undefined ? data.description : existing.description;
+      const percentOff =
+        discountType === "percent"
+          ? data.percentOff ?? (existing.percent_off == null ? null : Number(existing.percent_off))
+          : null;
+      const amountOffCents =
+        discountType === "fixed"
+          ? data.amountOffCents ??
+            (existing.amount_off_cents == null ? null : Number(existing.amount_off_cents))
+          : null;
+      const maxRedemptions =
+        data.maxRedemptions !== undefined
+          ? data.maxRedemptions
+          : existing.max_redemptions == null
+            ? null
+            : Number(existing.max_redemptions);
+      const startsAt =
+        data.startsAt !== undefined
+          ? data.startsAt
+            ? new Date(data.startsAt)
+            : null
+          : existing.starts_at
+            ? new Date(existing.starts_at)
+            : null;
+      const endsAt =
+        data.endsAt !== undefined
+          ? data.endsAt
+            ? new Date(data.endsAt)
+            : null
+          : existing.ends_at
+            ? new Date(existing.ends_at)
+            : null;
+      const active = data.active !== undefined ? (data.active ? 1 : 0) : Number(existing.active);
+
+      if (discountType === "percent" && !(percentOff != null && percentOff > 0)) {
+        return res.status(400).json({ error: "percentOff required for percent coupons." });
+      }
+      if (discountType === "fixed" && !(amountOffCents != null && amountOffCents > 0)) {
+        return res.status(400).json({ error: "amountOffCents required for fixed coupons." });
+      }
+
+      await db().execute(
+        `UPDATE coupons
+            SET code = ?, name = ?, description = ?, discount_type = ?, percent_off = ?,
+                amount_off_cents = ?, scope = ?, max_redemptions = ?, starts_at = ?, ends_at = ?, active = ?
+          WHERE id = ?`,
+        [
+          code,
+          name,
+          description,
+          discountType,
+          percentOff,
+          amountOffCents,
+          scope,
+          maxRedemptions,
+          startsAt,
+          endsAt,
+          active,
+          couponId,
+        ],
+      );
+
+      if (data.scope !== undefined || data.courseIds !== undefined || data.editionIds !== undefined) {
+        let courseIds = data.courseIds;
+        let editionIds = data.editionIds;
+        if (courseIds === undefined) {
+          const [crs] = await db().query<RowDataPacket[]>(
+            "SELECT course_id FROM coupon_courses WHERE coupon_id = ?",
+            [couponId],
+          );
+          courseIds = crs.map((row) => Number(row.course_id));
+        }
+        if (editionIds === undefined) {
+          const [eds] = await db().query<RowDataPacket[]>(
+            "SELECT edition_id FROM coupon_editions WHERE coupon_id = ?",
+            [couponId],
+          );
+          editionIds = eds.map((row) => Number(row.edition_id));
+        }
+        if (scope === "course" && courseIds.length < 1) {
+          return res.status(400).json({ error: "Pick at least one course for this coupon." });
+        }
+        if (scope === "edition" && editionIds.length < 1) {
+          return res.status(400).json({ error: "Pick at least one edition for this coupon." });
+        }
+        await replaceCouponScopes(couponId, scope, courseIds, editionIds);
+      }
+
+      const coupon = await couponAdminPayload(couponId);
+      res.json({ coupon });
+    } catch (error) {
+      const err = error as { code?: string };
+      if (err?.code === "ER_DUP_ENTRY") {
+        return res.status(409).json({ error: "That coupon code already exists.", code: "coupon_code_taken" });
+      }
+      sendDbError(res, err);
+    }
+  });
+
   app.get("/api/admin/team", requireOpsStaff, async (req, res) => {
     const q = parseListQuery(req, { limit: 25 });
     const sortMap: Record<string, string> = {
@@ -2946,7 +5108,8 @@ function buildApp(): Express {
     };
     const orderCol = sortMap[q.sortBy] || "a.role";
     const params: unknown[] = [];
-    let where = "WHERE 1=1";
+    // Instructors live under /admin/instructores — keep Equipo for ops/company roles.
+    let where = "WHERE a.role <> 'instructor'";
     if (q.search) {
       where += " AND (a.email LIKE ? OR a.first_name LIKE ? OR a.last_name LIKE ? OR c.name LIKE ?)";
       const like = `%${q.search}%`;
@@ -2988,6 +5151,12 @@ function buildApp(): Express {
       })
       .safeParse(req.body);
     if (!parsed.success) return res.status(400).json({ error: "Check the invitation." });
+    if (parsed.data.role === "instructor") {
+      return res.status(400).json({
+        error: "Invite instructors from the Instructores section.",
+        code: "use_instructors_section",
+      });
+    }
     if (parsed.data.role === "company" && !parsed.data.companyName) {
       return res.status(400).json({ error: "Add the company name for a company invite." });
     }
@@ -3167,6 +5336,465 @@ function buildApp(): Express {
         updatedAt: iso(row.updated_at),
       },
     });
+  });
+
+  app.get("/api/admin/bank-transfer-settings", requireOpsStaff, async (req, res) => {
+    const admin = (req as AuthedRequest).admin as AdminProfile;
+    if (!canManageTransfers(admin)) {
+      return res.status(403).json({ error: "Only owners, finance, and coordinators can view bank settings." });
+    }
+    const settings = await loadBankTransferSettings();
+    if (!settings) return res.status(404).json({ error: "Bank transfer settings are missing." });
+    res.json({ settings });
+  });
+
+  app.patch("/api/admin/bank-transfer-settings", requireOpsStaff, async (req, res) => {
+    const admin = (req as AuthedRequest).admin as AdminProfile;
+    if (!canManageTransfers(admin)) {
+      return res.status(403).json({ error: "Only owners, finance, and coordinators can edit bank settings." });
+    }
+    const parsed = z
+      .object({
+        bankName: z.string().trim().min(2).max(120),
+        accountHolder: z.string().trim().min(2).max(200),
+        clabe: z.string().trim().regex(/^\d{18}$/),
+        accountNumber: z.string().trim().max(40).nullable().optional(),
+        bankCode: z.string().trim().max(20).nullable().optional(),
+        instructionsEs: z.string().trim().max(4000).nullable().optional(),
+        instructionsEn: z.string().trim().max(4000).nullable().optional(),
+        expiresAfterDays: z.number().int().min(1).max(30),
+        isEnabled: z.boolean(),
+      })
+      .safeParse(req.body);
+    if (!parsed.success) {
+      return res.status(400).json({ error: "Check bank name, holder, 18-digit CLABE, and expiry days." });
+    }
+    await db().execute(
+      `UPDATE site_bank_transfer_settings
+          SET bank_name = ?, account_holder = ?, clabe = ?, account_number = ?, bank_code = ?,
+              instructions_es = ?, instructions_en = ?, expires_after_days = ?, is_enabled = ?,
+              updated_by_admin_id = ?
+        WHERE id = 1`,
+      [
+        parsed.data.bankName,
+        parsed.data.accountHolder,
+        parsed.data.clabe,
+        parsed.data.accountNumber ?? null,
+        parsed.data.bankCode ?? null,
+        parsed.data.instructionsEs ?? null,
+        parsed.data.instructionsEn ?? null,
+        parsed.data.expiresAfterDays,
+        parsed.data.isEnabled ? 1 : 0,
+        admin.id,
+      ],
+    );
+    const settings = await loadBankTransferSettings();
+    res.json({ settings });
+  });
+
+  app.get("/api/admin/transfers", requireOpsStaff, async (req, res) => {
+    const admin = (req as AuthedRequest).admin as AdminProfile;
+    if (!canManageTransfers(admin)) {
+      return res.status(403).json({ error: "Only owners, finance, and coordinators can manage transfers." });
+    }
+    await expireStaleTransferPayments();
+    const q = parseListQuery(req, { limit: 25 });
+    const statusFilter = String(req.query.status || "processing").trim();
+    const status =
+      statusFilter === "all" || statusFilter === "succeeded" || statusFilter === "failed" || statusFilter === "processing"
+        ? statusFilter
+        : "processing";
+    const sortMap: Record<string, string> = {
+      createdAt: "p.created_at",
+      amountCents: "p.amount_cents",
+      status: "p.status",
+      transferExpiresAt: "p.transfer_expires_at",
+      courseTitle: "c.title",
+      reference: "p.transfer_reference",
+    };
+    const orderCol = sortMap[q.sortBy] || "p.created_at";
+    const params: unknown[] = [];
+    let where = "WHERE p.method = 'transfer'";
+    if (status !== "all") {
+      where += " AND p.status = ?";
+      params.push(status);
+    }
+    if (q.search) {
+      where +=
+        " AND (c.title LIKE ? OR u.email LIKE ? OR u.first_name LIKE ? OR u.last_name LIKE ? OR p.transfer_reference LIKE ?)";
+      const like = `%${q.search}%`;
+      params.push(like, like, like, like, like);
+    }
+    const [countRows] = await db().query<RowDataPacket[]>(
+      `SELECT COUNT(*) AS total
+         FROM payments p
+         LEFT JOIN course_editions ed ON ed.id = p.edition_id
+         LEFT JOIN courses c ON c.id = ed.course_id
+         LEFT JOIN users u ON u.id = p.user_id
+         ${where}`,
+      params,
+    );
+    const total = Number(countRows[0]?.total || 0);
+    const [rows] = await db().query<RowDataPacket[]>(
+      `SELECT p.*, c.title AS course_title, u.email, u.first_name, u.last_name,
+              e.status AS enrollment_status,
+              a.first_name AS confirmed_by_first_name, a.last_name AS confirmed_by_last_name
+         FROM payments p
+         LEFT JOIN course_editions ed ON ed.id = p.edition_id
+         LEFT JOIN courses c ON c.id = ed.course_id
+         LEFT JOIN users u ON u.id = p.user_id
+         LEFT JOIN enrollments e ON e.id = p.enrollment_id
+         LEFT JOIN admins a ON a.id = p.confirmed_by_admin_id
+         ${where}
+        ORDER BY ${orderCol} ${q.sortDir}, p.id DESC
+        LIMIT ? OFFSET ?`,
+      [...params, q.limit, q.offset],
+    );
+    res.json({
+      transfers: rows.map((row) => ({
+        id: Number(row.id),
+        enrollmentId: row.enrollment_id == null ? null : Number(row.enrollment_id),
+        enrollmentStatus: row.enrollment_status || null,
+        amountCents: Number(row.amount_cents),
+        currency: row.currency,
+        status: row.status,
+        reference: row.transfer_reference,
+        expiresAt: row.transfer_expires_at ? iso(row.transfer_expires_at) : null,
+        confirmedAt: row.confirmed_at ? iso(row.confirmed_at) : null,
+        confirmedByName:
+          row.confirmed_by_first_name || row.confirmed_by_last_name
+            ? `${row.confirmed_by_first_name || ""} ${row.confirmed_by_last_name || ""}`.trim()
+            : null,
+        rejectedAt: row.rejected_at ? iso(row.rejected_at) : null,
+        rejectReason: row.reject_reason,
+        courseTitle: row.course_title,
+        email: row.email,
+        firstName: row.first_name,
+        lastName: row.last_name,
+        createdAt: iso(row.created_at),
+      })),
+      pagination: paginationOf(q.page, q.limit, total),
+    });
+  });
+
+  app.post("/api/admin/transfers/:id/confirm", requireOpsStaff, async (req, res) => {
+    const admin = (req as AuthedRequest).admin as AdminProfile;
+    if (!canManageTransfers(admin)) {
+      return res.status(403).json({ error: "Only owners, finance, and coordinators can confirm transfers." });
+    }
+    const paymentId = Number(req.params.id);
+    if (!Number.isFinite(paymentId) || paymentId < 1) {
+      return res.status(400).json({ error: "Invalid transfer." });
+    }
+    try {
+      const [seatCheck] = await db().query<RowDataPacket[]>(
+        `SELECT e.status AS enrollment_status
+           FROM payments p
+           JOIN enrollments e ON e.id = p.enrollment_id
+          WHERE p.id = ? AND p.method = 'transfer' LIMIT 1`,
+        [paymentId],
+      );
+      if (
+        seatCheck[0] &&
+        (seatCheck[0].enrollment_status === "cancelled" || seatCheck[0].enrollment_status === "no_show")
+      ) {
+        return res.status(409).json({
+          error: "That seat is no longer available.",
+          code: "seat_unavailable",
+        });
+      }
+      const result = await confirmTransferPayment({ paymentId, adminId: admin.id });
+      if (!result) {
+        return res.status(409).json({ error: "That transfer is not awaiting confirmation.", code: "transfer_not_pending" });
+      }
+      if (result.newlyPaid) {
+        try {
+          await sendSeatConfirmationEmail({
+            enrollmentId: result.enrollmentId,
+            method: "transfer",
+            brand: null,
+            last4: null,
+          });
+        } catch (error) {
+          console.error("transfer seat confirmation email", error);
+        }
+      }
+      res.json({ ok: true, newlyPaid: result.newlyPaid, enrollmentId: result.enrollmentId });
+    } catch (error) {
+      sendDbError(res, error as { code?: string; message?: string });
+    }
+  });
+
+  app.post("/api/admin/transfers/:id/reject", requireOpsStaff, async (req, res) => {
+    const admin = (req as AuthedRequest).admin as AdminProfile;
+    if (!canManageTransfers(admin)) {
+      return res.status(403).json({ error: "Only owners, finance, and coordinators can reject transfers." });
+    }
+    const paymentId = Number(req.params.id);
+    if (!Number.isFinite(paymentId) || paymentId < 1) {
+      return res.status(400).json({ error: "Invalid transfer." });
+    }
+    const parsed = z
+      .object({ reason: z.string().trim().max(400).optional() })
+      .safeParse(req.body || {});
+    if (!parsed.success) return res.status(400).json({ error: "Invalid reject reason." });
+    try {
+      const result = await rejectTransferPayment({
+        paymentId,
+        reason: parsed.data.reason || "rejected",
+      });
+      if (!result) {
+        return res.status(409).json({ error: "That transfer is not awaiting review.", code: "transfer_not_pending" });
+      }
+      res.json({ ok: true, enrollmentId: result.enrollmentId });
+    } catch (error) {
+      sendDbError(res, error as { code?: string; message?: string });
+    }
+  });
+
+  app.get("/api/admin/instructors", requireOpsStaff, async (req, res) => {
+    const admin = (req as AuthedRequest).admin as AdminProfile;
+    if (!canManageInstructors(admin) && !canWriteOperations(admin)) {
+      return res.status(403).json({ error: "Only owners and coordinators can browse instructors." });
+    }
+    const q = parseListQuery(req, { limit: 25 });
+    const activeOnly = String(req.query.activeOnly || "") === "1" || String(req.query.activeOnly || "") === "true";
+    const params: unknown[] = [];
+    let where = "WHERE a.role = 'instructor'";
+    if (activeOnly) {
+      where += " AND a.status IN ('active', 'invited')";
+    }
+    if (q.search) {
+      where += " AND (a.email LIKE ? OR a.first_name LIKE ? OR a.last_name LIKE ?)";
+      const like = `%${q.search}%`;
+      params.push(like, like, like);
+    }
+    const [countRows] = await db().query<RowDataPacket[]>(
+      `SELECT COUNT(*) AS total FROM admins a ${where}`,
+      params,
+    );
+    const total = Number(countRows[0]?.total || 0);
+    const [rows] = await db().query<RowDataPacket[]>(
+      `SELECT a.*,
+              (SELECT COUNT(*) FROM course_editions e
+                WHERE e.instructor_admin_id = a.id
+                  AND e.status IN ('presale', 'confirmed')) AS assigned_editions
+         FROM admins a
+         ${where}
+        ORDER BY a.first_name ASC, a.last_name ASC, a.id ASC
+        LIMIT ? OFFSET ?`,
+      [...params, q.limit, q.offset],
+    );
+    res.json({
+      instructors: rows.map((row) => ({
+        ...adminFromRow(row),
+        assignedEditions: Number(row.assigned_editions || 0),
+      })),
+      pagination: paginationOf(q.page, q.limit, total),
+    });
+  });
+
+  app.post("/api/admin/instructors", requireOpsStaff, async (req, res) => {
+    const admin = (req as AuthedRequest).admin as AdminProfile;
+    if (!canManageInstructors(admin)) {
+      return res.status(403).json({ error: "Only owners and coordinators can invite instructors." });
+    }
+    const parsed = z
+      .object({
+        email: emailSchema,
+        firstName: z.string().trim().min(1).max(120),
+        lastName: z.string().trim().max(120).default(""),
+      })
+      .safeParse(req.body);
+    if (!parsed.success) return res.status(400).json({ error: "Check the instructor invitation." });
+    try {
+      const [result] = await db().execute<ResultSetHeader>(
+        "INSERT INTO admins (email, first_name, last_name, role, status) VALUES (?, ?, ?, 'instructor', 'invited')",
+        [parsed.data.email, parsed.data.firstName, parsed.data.lastName],
+      );
+      await sendStaffWelcomeEmail({
+        email: parsed.data.email,
+        firstName: parsed.data.firstName,
+        role: "instructor",
+      });
+      res.status(201).json({ id: result.insertId });
+    } catch (error) {
+      sendDbError(res, error as { code?: string });
+    }
+  });
+
+  app.patch("/api/admin/instructors/:id", requireOpsStaff, async (req, res) => {
+    const admin = (req as AuthedRequest).admin as AdminProfile;
+    if (!canManageInstructors(admin)) {
+      return res.status(403).json({ error: "Only owners and coordinators can update instructors." });
+    }
+    const instructorId = Number(req.params.id);
+    if (!Number.isFinite(instructorId) || instructorId < 1) {
+      return res.status(400).json({ error: "Invalid instructor." });
+    }
+    const parsed = z
+      .object({
+        status: z.enum(["active", "invited", "disabled"]).optional(),
+        firstName: z.string().trim().min(1).max(120).optional(),
+        lastName: z.string().trim().max(120).optional(),
+      })
+      .safeParse(req.body);
+    if (!parsed.success) return res.status(400).json({ error: "Check the instructor update." });
+    const [existing] = await db().query<RowDataPacket[]>(
+      "SELECT id FROM admins WHERE id = ? AND role = 'instructor' LIMIT 1",
+      [instructorId],
+    );
+    if (!existing[0]) return res.status(404).json({ error: "Instructor not found." });
+    const sets: string[] = [];
+    const values: unknown[] = [];
+    if (parsed.data.status) {
+      sets.push("status = ?");
+      values.push(parsed.data.status);
+    }
+    if (parsed.data.firstName) {
+      sets.push("first_name = ?");
+      values.push(parsed.data.firstName);
+    }
+    if (parsed.data.lastName !== undefined) {
+      sets.push("last_name = ?");
+      values.push(parsed.data.lastName);
+    }
+    if (!sets.length) return res.status(400).json({ error: "Nothing to update." });
+    values.push(instructorId);
+    await db().query(`UPDATE admins SET ${sets.join(", ")} WHERE id = ?`, values);
+    res.json({ ok: true });
+  });
+
+  app.get("/api/instructor/editions", requireAdmin, async (req, res) => {
+    const admin = (req as AuthedRequest).admin as AdminProfile;
+    if (!isInstructorRole(admin)) {
+      return res.status(403).json({ error: "This area is for instructors." });
+    }
+    const [rows] = await db().query<RowDataPacket[]>(
+      `SELECT e.*,
+              c.title AS course_title, c.slug AS course_slug,
+              TRIM(CONCAT(COALESCE(a.first_name, ''), ' ', COALESCE(a.last_name, ''))) AS instructor_name,
+              (SELECT COUNT(*) FROM enrollments n WHERE n.edition_id = e.id AND n.status IN ('paid','attended')) AS paid_count,
+              (SELECT COUNT(*) FROM enrollments n WHERE n.edition_id = e.id AND n.status IN ('pending','paid','attended')) AS held_count
+         FROM course_editions e
+         JOIN courses c ON c.id = e.course_id
+         LEFT JOIN admins a ON a.id = e.instructor_admin_id
+        WHERE e.instructor_admin_id = ?
+          AND e.status IN ('presale', 'confirmed', 'completed')
+        ORDER BY e.starts_at ASC`,
+      [admin.id],
+    );
+    res.json({
+      editions: rows.map((row) => ({
+        ...editionFromRow(row),
+        courseTitle: row.course_title,
+        courseSlug: row.course_slug,
+      })),
+    });
+  });
+
+  app.get("/api/instructor/editions/:id/participants", requireAdmin, async (req, res) => {
+    const admin = (req as AuthedRequest).admin as AdminProfile;
+    if (!isInstructorRole(admin)) {
+      return res.status(403).json({ error: "This area is for instructors." });
+    }
+    const editionId = Number(req.params.id);
+    if (!Number.isFinite(editionId) || editionId < 1) {
+      return res.status(400).json({ error: "Invalid edition." });
+    }
+    const [editionRows] = await db().query<RowDataPacket[]>(
+      `SELECT e.id, c.title AS course_title
+         FROM course_editions e
+         JOIN courses c ON c.id = e.course_id
+        WHERE e.id = ? AND e.instructor_admin_id = ?
+        LIMIT 1`,
+      [editionId, admin.id],
+    );
+    if (!editionRows[0]) return res.status(404).json({ error: "Edition not found." });
+
+    const [rows] = await db().query<RowDataPacket[]>(
+      `SELECT e.id, e.status, e.payment_method, e.paid_at, e.amount_cents, e.currency,
+              u.first_name, u.last_name, u.email, u.phone
+         FROM enrollments e
+         JOIN users u ON u.id = e.user_id
+        WHERE e.edition_id = ? AND e.status IN ('paid', 'attended')
+        ORDER BY e.paid_at DESC, e.id DESC`,
+      [editionId],
+    );
+    res.json({
+      editionId,
+      courseTitle: editionRows[0].course_title,
+      participants: rows.map((row) => ({
+        id: Number(row.id),
+        status: row.status,
+        paymentMethod: row.payment_method,
+        paidAt: row.paid_at ? iso(row.paid_at) : null,
+        amountCents: Number(row.amount_cents),
+        currency: row.currency,
+        firstName: row.first_name,
+        lastName: row.last_name,
+        email: row.email,
+        phone: row.phone,
+      })),
+    });
+  });
+
+  app.get("/api/admin/notifications", requireAdmin, async (req, res) => {
+    const admin = (req as AuthedRequest).admin as AdminProfile;
+    const unreadOnly = String(req.query.unreadOnly || "") === "1" || String(req.query.unreadOnly || "") === "true";
+    const limit = Math.min(50, Math.max(1, Number(req.query.limit) || 20));
+    const params: unknown[] = [admin.id];
+    let where = "WHERE admin_id = ?";
+    if (unreadOnly) where += " AND read_at IS NULL";
+    const [countRows] = await db().query<RowDataPacket[]>(
+      `SELECT COUNT(*) AS total FROM admin_notifications ${where}`,
+      params,
+    );
+    const [unreadRows] = await db().query<RowDataPacket[]>(
+      "SELECT COUNT(*) AS total FROM admin_notifications WHERE admin_id = ? AND read_at IS NULL",
+      [admin.id],
+    );
+    const [rows] = await db().query<RowDataPacket[]>(
+      `SELECT * FROM admin_notifications ${where}
+        ORDER BY created_at DESC, id DESC
+        LIMIT ?`,
+      [...params, limit],
+    );
+    res.json({
+      unreadCount: Number(unreadRows[0]?.total || 0),
+      total: Number(countRows[0]?.total || 0),
+      notifications: rows.map((row) => ({
+        id: Number(row.id),
+        kind: row.kind,
+        title: row.title,
+        body: row.body,
+        linkPath: row.link_path,
+        enrollmentId: row.enrollment_id == null ? null : Number(row.enrollment_id),
+        editionId: row.edition_id == null ? null : Number(row.edition_id),
+        readAt: row.read_at ? iso(row.read_at) : null,
+        createdAt: iso(row.created_at),
+      })),
+    });
+  });
+
+  app.post("/api/admin/notifications/:id/read", requireAdmin, async (req, res) => {
+    const admin = (req as AuthedRequest).admin as AdminProfile;
+    const id = Number(req.params.id);
+    if (!Number.isFinite(id) || id < 1) return res.status(400).json({ error: "Invalid notification." });
+    await db().execute(
+      "UPDATE admin_notifications SET read_at = COALESCE(read_at, NOW()) WHERE id = ? AND admin_id = ?",
+      [id, admin.id],
+    );
+    res.json({ ok: true });
+  });
+
+  app.post("/api/admin/notifications/read-all", requireAdmin, async (req, res) => {
+    const admin = (req as AuthedRequest).admin as AdminProfile;
+    await db().execute(
+      "UPDATE admin_notifications SET read_at = NOW() WHERE admin_id = ? AND read_at IS NULL",
+      [admin.id],
+    );
+    res.json({ ok: true });
   });
 
   app.use((error: Error, _req: Request, res: Response, _next: NextFunction) => {

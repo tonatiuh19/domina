@@ -201,6 +201,11 @@ export function CourseDetail() {
                   <p className="mt-1 text-sm text-muted-foreground">
                     {edition.venueName} · {edition.city}
                   </p>
+                  <p className="mt-1 text-sm text-muted-foreground">
+                    {t("home.withInstructor", {
+                      name: edition.instructorName?.trim() || t("course.instructorTbd"),
+                    })}
+                  </p>
                   <p className="mt-2 text-sm">
                     {edition.paidCount}/{edition.minEnrollment} · {formatMoney(edition.priceCents, edition.currency)}
                   </p>

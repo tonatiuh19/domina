@@ -160,23 +160,84 @@ describe("portal enrollments + payment fulfillment", () => {
   });
 
   it("checkout confirm/create return 503 under VITEST (no live Stripe)", async () => {
+    const email = `${runId}-nostripe@example.test`;
+    const token = await loginUser(app, email);
     const reserved = await request(app)
       .post("/api/portal/enrollments")
-      .set(auth(learnerToken))
+      .set(auth(token))
       .send({ editionId });
+    expect([200, 201]).toContain(reserved.status);
     const enrollmentId = reserved.body.enrollmentId as number;
 
     const checkout = await request(app)
       .post("/api/portal/checkout")
-      .set(auth(learnerToken))
+      .set(auth(token))
       .send({ enrollmentId });
     expect(checkout.status).toBe(503);
 
     const confirm = await request(app)
       .post("/api/portal/checkout/confirm")
-      .set(auth(learnerToken))
+      .set(auth(token))
       .send({ sessionId: "cs_test_missing_session_xx" });
     expect(confirm.status).toBe(503);
+  });
+
+  it("records OXXO pending and still allows checkout restart under VITEST", async () => {
+    const email = `${runId}-oxxo@example.test`;
+    const token = await loginUser(app, email);
+    const reserved = await request(app)
+      .post("/api/portal/enrollments")
+      .set(auth(token))
+      .send({ editionId });
+    expect([200, 201]).toContain(reserved.status);
+    const enrollmentId = reserved.body.enrollmentId as number;
+
+    const simulated = await request(app)
+      .post("/api/portal/checkout/simulate")
+      .set(auth(token))
+      .send({ enrollmentId, pendingOxxo: true });
+    expect(simulated.status).toBe(200);
+    expect(simulated.body.status).toBe("pending_oxxo");
+
+    const detail = await request(app).get(`/api/portal/enrollments/${enrollmentId}`).set(auth(token));
+    expect(detail.status).toBe(200);
+    expect(detail.body.enrollment.paymentMethod).toBe("oxxo");
+    expect(detail.body.enrollment.status).toBe("pending");
+
+    // No live Stripe in VITEST — reports pending_oxxo instead of minting a session.
+    const first = await request(app).post("/api/portal/checkout").set(auth(token)).send({ enrollmentId });
+    expect(first.status).toBe(200);
+    expect(first.body.status).toBe("pending_oxxo");
+    expect(first.body.enrollmentId).toBe(enrollmentId);
+
+    const [payments] = await pool.query<RowDataPacket[]>(
+      "SELECT status, method FROM payments WHERE enrollment_id = ? ORDER BY id DESC",
+      [enrollmentId],
+    );
+    expect(payments.length).toBeGreaterThanOrEqual(1);
+    expect(payments.some((row) => row.method === "oxxo" && row.status === "processing")).toBe(true);
+
+    const emailed = await request(app)
+      .post("/api/portal/checkout/oxxo-email")
+      .set(auth(token))
+      .send({ enrollmentId });
+    expect(emailed.status).toBe(200);
+    expect(emailed.body.ok).toBe(true);
+    expect(emailed.body.skipped).toBe(true);
+
+    const voucher = await request(app)
+      .post("/api/portal/checkout/oxxo-voucher")
+      .set(auth(token))
+      .send({ enrollmentId });
+    expect(voucher.status).toBe(200);
+    expect(voucher.body.voucher?.url).toBeTruthy();
+    expect(voucher.body.voucher?.amountCents).toBeGreaterThan(0);
+
+    const missing = await request(app)
+      .post("/api/portal/checkout/oxxo-email")
+      .set(auth(token))
+      .send({ enrollmentId: 99999999 });
+    expect(missing.status).toBe(404);
   });
 
   it("accepts course feedback after payment", async () => {

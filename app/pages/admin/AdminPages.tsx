@@ -12,6 +12,7 @@ import { AdminCardsSkeleton, Skeleton } from "@/components/ui/skeleton";
 import { DataGrid, type DataGridColumn } from "@/components/ui/data-grid";
 import { AdminPageHeader } from "@/components/admin/AdminPageHeader";
 import { AdminSection } from "@/components/admin/AdminShell";
+import { InstructorPicker } from "@/components/admin/InstructorPicker";
 import { Field } from "@/components/admin/Field";
 import { COURSE_GALLERY_MAX, ImageDropzone } from "@/components/admin/ImageDropzone";
 import { RichHtmlEditor } from "@/components/admin/RichHtmlEditor";
@@ -45,6 +46,13 @@ export { AdminCoursesPage as AdminCourses } from "@/pages/admin/AdminCoursesPage
 export { AdminCourseCreatePage as AdminCourseCreate } from "@/pages/admin/AdminCourseCreatePage";
 export { AdminCatalogPage as AdminCatalog } from "@/pages/admin/AdminCatalogPage";
 export { AdminParticipantsPage as AdminParticipants } from "@/pages/admin/AdminParticipantsPage";
+export { AdminTransfersPage as AdminTransfers } from "@/pages/admin/AdminTransfersPage";
+export { AdminCouponsPage as AdminCoupons } from "@/pages/admin/AdminCouponsPage";
+export { AdminInstructorsPage as AdminInstructors } from "@/pages/admin/AdminInstructorsPage";
+export {
+  InstructorEditionsPage as InstructorEditions,
+  InstructorEditionDetailPage as InstructorEditionDetail,
+} from "@/pages/admin/InstructorEditionsPage";
 
 export function AdminHome() {
   const { t } = useTranslation();
@@ -184,6 +192,7 @@ export function AdminCourse() {
       startsAt: "",
       endsAt: "",
       venueId: 0,
+      instructorAdminId: null as number | null,
       capacity: course?.capacity || 15,
       priceCents: course?.priceCents || 0,
       minEnrollment: course?.minEnrollment || 8,
@@ -205,6 +214,7 @@ export function AdminCourse() {
             startsAt: values.startsAt.replace("T", " "),
             endsAt: values.endsAt.replace("T", " "),
             venueId: Number(values.venueId),
+            instructorAdminId: values.instructorAdminId,
             capacity: Number(values.capacity),
             priceCents: Number(values.priceCents),
             minEnrollment: Number(values.minEnrollment),
@@ -214,6 +224,8 @@ export function AdminCourse() {
       if (createEdition.fulfilled.match(created)) void dispatch(fetchAdminCourse({ id: Number(id) }));
     },
   });
+
+  const selectedEdition = editions.find((edition) => edition.id === editionId) || null;
 
   useEffect(() => {
     if (Number(editionForm.values.venueId) > 0) return;
@@ -420,16 +432,34 @@ export function AdminCourse() {
           ))}
         </div>
         {editionId ? (
-          <Button
-            className="mt-4"
-            variant="outline"
-            onClick={async () => {
-              await dispatch(saveEdition({ id: editionId, body: { status: "confirmed" } }));
-              void dispatch(fetchAdminCourse({ id: Number(id), editionId }));
-            }}
-          >
-            {t("admin.confirm")}
-          </Button>
+          <div className="mt-4 flex max-w-full flex-wrap items-center gap-2">
+            <Button
+              variant="outline"
+              onClick={async () => {
+                await dispatch(saveEdition({ id: editionId, body: { status: "confirmed" } }));
+                void dispatch(fetchAdminCourse({ id: Number(id), editionId }));
+              }}
+            >
+              {t("admin.confirm")}
+            </Button>
+            <p className="text-sm text-muted-foreground break-words">
+              {selectedEdition?.instructorName
+                ? t("admin.editionInstructor", { name: selectedEdition.instructorName })
+                : t("admin.instructorUnassigned")}
+            </p>
+          </div>
+        ) : null}
+        {editionId ? (
+          <div className="mt-4 max-w-xl rounded-2xl border border-border bg-paper p-4">
+            <InstructorPicker
+              value={selectedEdition?.instructorAdminId ?? null}
+              onChange={(instructorAdminId) => {
+                void dispatch(saveEdition({ id: editionId, body: { instructorAdminId } })).then(() => {
+                  void dispatch(fetchAdminCourse({ id: Number(id), editionId }));
+                });
+              }}
+            />
+          </div>
         ) : null}
       </div>
 
@@ -482,6 +512,10 @@ export function AdminCourse() {
           </select>
           <p className="text-[11px] text-muted-foreground">{t("admin.venueLegend")}</p>
         </div>
+        <InstructorPicker
+          value={editionForm.values.instructorAdminId}
+          onChange={(instructorAdminId) => void editionForm.setFieldValue("instructorAdminId", instructorAdminId)}
+        />
         <Button type="submit">{t("admin.schedule")}</Button>
       </form>
     </AdminSection>
@@ -535,6 +569,18 @@ export function AdminPayments() {
         sortable: true,
         shrink: true,
         render: (payment) => `${payment.method}${payment.cardLast4 ? ` ···· ${payment.cardLast4}` : ""}`,
+      },
+      {
+        key: "couponCode",
+        label: t("admin.couponCodeCol"),
+        shrink: true,
+        wrap: true,
+        render: (payment) =>
+          payment.couponCode ? (
+            <span className="font-mono text-sm break-all">{payment.couponCode}</span>
+          ) : (
+            "—"
+          ),
       },
       { key: "status", label: t("admin.status"), sortable: true, shrink: true },
       {
@@ -758,11 +804,11 @@ export function AdminTeam() {
           <Input placeholder={t("common.lastName")} {...form.getFieldProps("lastName")} />
           <select className="h-11 rounded-md border border-input bg-card px-3" {...form.getFieldProps("role")}>
             <option value="coordinator">coordinator</option>
-            <option value="instructor">instructor</option>
             <option value="finance">finance</option>
             <option value="owner">owner</option>
             <option value="company">company</option>
           </select>
+          <p className="text-xs text-muted-foreground">{t("admin.teamInviteInstructorHint")}</p>
           {form.values.role === "company" ? (
             <Input placeholder={t("auth.companyName")} {...form.getFieldProps("companyName")} />
           ) : null}

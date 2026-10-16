@@ -60,10 +60,37 @@ paths:
       summary: Single learner seat by id (refresh-safe pay page)
   /portal/checkout:
     post:
-      summary: Stripe Checkout elements client secret with card + OXXO; return_url lands on /cuenta/exito
+      summary: Stripe Checkout elements client secret with card + OXXO; return_url lands on /cuenta/pagar/:id. After an OXXO voucher, mints a fresh open session so payment methods stay available (prior OXXO payment row kept as processing).
   /portal/checkout/confirm:
     post:
-      summary: Mark a seat paid after Stripe redirects back, when no webhook is configured
+      summary: Mark a seat paid (or pending_oxxo) after Stripe returns to the pay page; pending_oxxo also emails the branded voucher
+  /portal/checkout/oxxo-email:
+    post:
+      summary: Email (or resend) the branded OXXO voucher with hosted barcode link for a pending seat
+  /portal/checkout/oxxo-voucher:
+    post:
+      summary: Load OXXO voucher details (URL, reference, expiry) for the branded in-app voucher modal
+  /portal/checkout/transfer:
+    post:
+      summary: Start a non-Stripe SPEI transfer hold with DOMINA-{enrollmentId} concept
+  /portal/checkout/coupon:
+    post:
+      summary: Apply a DOMINA-owned coupon on the pay page; updates enrollment.amount_cents for card/OXXO/SPEI
+    delete:
+      summary: Remove an applied coupon before pay and restore list price
+  /portal/checkout/confirm-free:
+    post:
+      summary: Confirm a $0 seat after a coupon brings the total to zero (no Stripe/SPEI)
+  /admin/coupons:
+    get:
+      summary: List coupons (owner + finance)
+    post:
+      summary: Create a coupon code (owner + finance)
+  /admin/coupons/{id}:
+    get:
+      summary: Load one coupon with scope ids and redemption count
+    patch:
+      summary: Update coupon fields, scope, or active flag
   /site/pages/{slug}:
     get:
       summary: Public legal page markdown (terminos, privacidad) localized by lang query
@@ -138,14 +165,51 @@ paths:
   /admin/payments:
     get:
       summary: Paginated payment ledger
+  /admin/transfers:
+    get:
+      summary: SPEI transfer queue (processing/succeeded/failed)
+  /admin/transfers/{id}/confirm:
+    post:
+      summary: Confirm a pending bank transfer and mark the seat paid
+  /admin/transfers/{id}/reject:
+    post:
+      summary: Reject a pending transfer; enrollment stays pending for another method
+  /admin/bank-transfer-settings:
+    get:
+      summary: Bank account details shown for SPEI checkout
+    patch:
+      summary: Update bank transfer settings (owner/finance/coordinator)
   /admin/team:
     get:
-      summary: Paginated staff roster including company role accounts
+      summary: Paginated staff roster (excludes instructors; use Instructores)
     post:
-      summary: Invite staff or a company contact
+      summary: Invite staff or a company contact (not instructors)
   /admin/team/{id}:
     patch:
       summary: Change staff role or status
+  /admin/instructors:
+    get:
+      summary: Search/list instructors (owner/coordinator); supports q + activeOnly
+    post:
+      summary: Invite an instructor with welcome email (owner/coordinator)
+  /admin/instructors/{id}:
+    patch:
+      summary: Update instructor status or name
+  /instructor/editions:
+    get:
+      summary: Editions assigned to the signed-in instructor
+  /instructor/editions/{id}/participants:
+    get:
+      summary: Paid roster for an instructor-owned edition
+  /admin/notifications:
+    get:
+      summary: In-app notification inbox for the signed-in staff member
+  /admin/notifications/{id}/read:
+    post:
+      summary: Mark one notification read
+  /admin/notifications/read-all:
+    post:
+      summary: Mark all notifications read
   /admin/requests:
     get:
       summary: All company requests for ops

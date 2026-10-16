@@ -10,6 +10,7 @@ import { AccountHome, AccountProfile, PaySeat, PaymentSuccess } from "@/pages/cl
 import {
   AdminCatalog,
   AdminCompanyRequests,
+  AdminCoupons,
   AdminCourse,
   AdminCourseCreate,
   AdminCourses,
@@ -17,9 +18,13 @@ import {
   AdminLayout,
   AdminLegalPageEdit,
   AdminLegalPages,
+  AdminInstructors,
   AdminParticipants,
   AdminPayments,
   AdminTeam,
+  AdminTransfers,
+  InstructorEditionDetail,
+  InstructorEditions,
 } from "@/pages/admin/AdminPages";
 
 export default function App() {
@@ -47,6 +52,11 @@ export default function App() {
           <Route path="cursos/:id" element={<AdminCourse />} />
           <Route path="participantes" element={<AdminParticipants />} />
           <Route path="pagos" element={<AdminPayments />} />
+          <Route path="transferencias" element={<AdminTransfers />} />
+          <Route path="cupones" element={<AdminCoupons />} />
+          <Route path="instructores" element={<AdminInstructors />} />
+          <Route path="mis-ediciones" element={<InstructorEditions />} />
+          <Route path="mis-ediciones/:id" element={<InstructorEditionDetail />} />
           <Route path="legal" element={<AdminLegalPages />} />
           <Route path="legal/:slug" element={<AdminLegalPageEdit />} />
           <Route path="equipo" element={<AdminTeam />} />

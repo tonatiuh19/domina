@@ -56,11 +56,14 @@ describe("admin authorization matrix", () => {
     expect(dash.status).toBe(403);
   });
 
-  it("ops staff can read dashboard; instructor/finance cannot write catalog", async () => {
-    for (const token of [ownerToken, coordinatorToken, instructorToken, financeToken]) {
+  it("ops staff can read dashboard; instructor is scoped out of ops APIs", async () => {
+    for (const token of [ownerToken, coordinatorToken, financeToken]) {
       const dash = await request(app).get("/api/admin/dashboard").set(auth(token));
       expect(dash.status).toBe(200);
     }
+
+    const instructorDash = await request(app).get("/api/admin/dashboard").set(auth(instructorToken));
+    expect(instructorDash.status).toBe(403);
 
     const instructorWrite = await request(app)
       .post("/api/admin/catalog/categories")
@@ -85,7 +88,7 @@ describe("admin authorization matrix", () => {
       .send({
         email: `${runId}-invitee@example.test`,
         firstName: "Inv",
-        role: "instructor",
+        role: "finance",
       });
     expect(coordInvite.status).toBe(403);
 
@@ -95,7 +98,7 @@ describe("admin authorization matrix", () => {
       .send({
         email: `${runId}-invitee@example.test`,
         firstName: "Inv",
-        role: "instructor",
+        role: "finance",
       });
     expect(ownerInvite.status).toBe(201);
   });
@@ -110,6 +113,20 @@ describe("admin authorization matrix", () => {
     ]) {
       const res = await request(app).get(path).set(auth(coordinatorToken));
       expect(res.status).toBe(200);
+    }
+  });
+
+  it("only owner and finance can manage coupons", async () => {
+    const coord = await request(app).get("/api/admin/coupons").set(auth(coordinatorToken));
+    expect(coord.status).toBe(403);
+    const instructor = await request(app).get("/api/admin/coupons").set(auth(instructorToken));
+    expect(instructor.status).toBe(403);
+    const company = await request(app).get("/api/admin/coupons").set(auth(companyToken));
+    expect(company.status).toBe(403);
+
+    for (const token of [ownerToken, financeToken]) {
+      const ok = await request(app).get("/api/admin/coupons").set(auth(token));
+      expect(ok.status).toBe(200);
     }
   });
 });

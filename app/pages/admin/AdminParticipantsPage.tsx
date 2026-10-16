@@ -134,6 +134,14 @@ export function AdminParticipantsPage() {
         render: (row) => row.paymentMethod || "—",
       },
       {
+        key: "couponCode",
+        label: t("admin.couponCodeCol"),
+        shrink: true,
+        wrap: true,
+        render: (row) =>
+          row.couponCode ? <span className="font-mono text-sm break-all">{row.couponCode}</span> : "—",
+      },
+      {
         key: "amountCents",
         label: t("admin.price"),
         sortable: true,

@@ -13,7 +13,13 @@ export type EnrollmentStatus =
   | "cancelled"
   | "attended"
   | "no_show";
-export type PaymentMethod = "card" | "transfer" | "company_invoice" | "complimentary" | "oxxo";
+export type PaymentMethod =
+  | "card"
+  | "transfer"
+  | "company_invoice"
+  | "complimentary"
+  | "oxxo"
+  | "coupon";
 export type PaymentStatus =
   | "requires_payment"
   | "processing"
@@ -169,6 +175,9 @@ export interface AdminParticipantRow {
   status: EnrollmentStatus;
   amountCents: number;
   currency: string;
+  listAmountCents?: number | null;
+  discountCents?: number;
+  couponCode?: string | null;
   paymentMethod: PaymentMethod | null;
   cardBrand: string | null;
   cardLast4: string | null;

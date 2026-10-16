@@ -42,7 +42,63 @@ export interface PaymentRow {
   firstName: string | null;
   lastName: string | null;
   companyName: string | null;
+  couponCode?: string | null;
+  listAmountCents?: number | null;
+  discountCents?: number;
   createdAt: string;
+}
+
+export interface CouponRow {
+  id: number;
+  code: string;
+  name: string;
+  description: string | null;
+  discountType: "percent" | "fixed";
+  percentOff: number | null;
+  amountOffCents: number | null;
+  currency: string;
+  scope: "all" | "course" | "edition";
+  courseIds?: number[];
+  editionIds?: number[];
+  maxRedemptions: number | null;
+  redemptionCount: number;
+  startsAt: string | null;
+  endsAt: string | null;
+  active: boolean;
+  createdAt: string;
+  updatedAt?: string;
+}
+
+export interface TransferRow {
+  id: number;
+  enrollmentId: number | null;
+  enrollmentStatus: string | null;
+  amountCents: number;
+  currency: string;
+  status: string;
+  reference: string | null;
+  expiresAt: string | null;
+  confirmedAt: string | null;
+  confirmedByName: string | null;
+  rejectedAt: string | null;
+  rejectReason: string | null;
+  courseTitle: string | null;
+  email: string | null;
+  firstName: string | null;
+  lastName: string | null;
+  createdAt: string;
+}
+
+export interface BankTransferSettings {
+  bankName: string;
+  accountHolder: string;
+  clabe: string;
+  accountNumber: string | null;
+  bankCode: string | null;
+  instructionsEs: string | null;
+  instructionsEn: string | null;
+  expiresAfterDays: number;
+  isEnabled: boolean;
 }
 
 export interface AdminListQuery {
@@ -53,12 +109,42 @@ export interface AdminListQuery {
   sortDir?: "ASC" | "DESC";
   courseId?: number;
   editionId?: number;
+  status?: string;
 }
 
 export interface EditionOption extends CourseEdition {
   courseTitle?: string;
   courseSlug?: string;
 }
+
+export type InstructorRow = AdminProfile & { assignedEditions?: number };
+
+export type AdminNotification = {
+  id: number;
+  kind: string;
+  title: string;
+  body: string;
+  linkPath: string | null;
+  enrollmentId: number | null;
+  editionId: number | null;
+  readAt: string | null;
+  createdAt: string;
+};
+
+export type InstructorEdition = EditionOption & { courseSlug?: string };
+
+export type InstructorParticipant = {
+  id: number;
+  status: string;
+  paymentMethod: PaymentMethod | null;
+  paidAt: string | null;
+  amountCents: number;
+  currency: string;
+  firstName: string;
+  lastName: string;
+  email: string;
+  phone: string | null;
+};
 
 interface AdminState {
   stats: {
@@ -81,8 +167,20 @@ interface AdminState {
   feedback: { averageRating: number | null; reviews: number };
   payments: PaymentRow[];
   paymentsPagination: PaginationInfo | null;
+  transfers: TransferRow[];
+  transfersPagination: PaginationInfo | null;
+  bankTransferSettings: BankTransferSettings | null;
+  coupons: CouponRow[];
+  couponsPagination: PaginationInfo | null;
   team: AdminProfile[];
   teamPagination: PaginationInfo | null;
+  instructors: InstructorRow[];
+  instructorsPagination: PaginationInfo | null;
+  myEditions: InstructorEdition[];
+  myParticipants: InstructorParticipant[];
+  myParticipantsCourseTitle: string | null;
+  notifications: AdminNotification[];
+  unreadNotifications: number;
   catalog: Record<CatalogKind, CatalogOption[]>;
   catalogLoading: boolean;
   loading: boolean;
@@ -116,8 +214,20 @@ const initialState: AdminState = {
   feedback: { averageRating: null, reviews: 0 },
   payments: [],
   paymentsPagination: emptyPagination,
+  transfers: [],
+  transfersPagination: emptyPagination,
+  bankTransferSettings: null,
+  coupons: [],
+  couponsPagination: emptyPagination,
   team: [],
   teamPagination: emptyPagination,
+  instructors: [],
+  instructorsPagination: emptyPagination,
+  myEditions: [],
+  myParticipants: [],
+  myParticipantsCourseTitle: null,
+  notifications: [],
+  unreadNotifications: 0,
   catalog: emptyCatalog,
   catalogLoading: false,
   loading: false,
@@ -139,6 +249,7 @@ function listParams(query: AdminListQuery = {}) {
     sortDir: query.sortDir || undefined,
     courseId: query.courseId || undefined,
     editionId: query.editionId || undefined,
+    status: query.status || undefined,
   };
 }
 
@@ -362,6 +473,122 @@ export const fetchPayments = createAsyncThunk(
   },
 );
 
+export const fetchTransfers = createAsyncThunk(
+  "admin/transfers",
+  async (query: AdminListQuery | undefined, { getState, rejectWithValue }) => {
+    try {
+      const { data } = await axios.get("/api/admin/transfers", {
+        headers: headers(getState),
+        params: listParams(query),
+      });
+      return data as { transfers: TransferRow[]; pagination: PaginationInfo };
+    } catch (error) {
+      return rejectWithValue(formatAxiosError(error));
+    }
+  },
+);
+
+export const confirmTransfer = createAsyncThunk(
+  "admin/confirmTransfer",
+  async (paymentId: number, { getState, rejectWithValue }) => {
+    try {
+      const { data } = await axios.post(
+        `/api/admin/transfers/${paymentId}/confirm`,
+        {},
+        { headers: headers(getState) },
+      );
+      return data as { ok: boolean; newlyPaid: boolean; enrollmentId: number };
+    } catch (error) {
+      return rejectWithValue(formatAxiosError(error));
+    }
+  },
+);
+
+export const rejectTransfer = createAsyncThunk(
+  "admin/rejectTransfer",
+  async (input: { paymentId: number; reason?: string }, { getState, rejectWithValue }) => {
+    try {
+      const { data } = await axios.post(
+        `/api/admin/transfers/${input.paymentId}/reject`,
+        { reason: input.reason },
+        { headers: headers(getState) },
+      );
+      return data as { ok: boolean; enrollmentId: number };
+    } catch (error) {
+      return rejectWithValue(formatAxiosError(error));
+    }
+  },
+);
+
+export const fetchCoupons = createAsyncThunk(
+  "admin/coupons",
+  async (query: AdminListQuery | undefined, { getState, rejectWithValue }) => {
+    try {
+      const { data } = await axios.get("/api/admin/coupons", {
+        headers: headers(getState),
+        params: listParams(query),
+      });
+      return data as { coupons: CouponRow[]; pagination: PaginationInfo };
+    } catch (error) {
+      return rejectWithValue(formatAxiosError(error));
+    }
+  },
+);
+
+export const createCoupon = createAsyncThunk(
+  "admin/createCoupon",
+  async (body: Record<string, unknown>, { getState, rejectWithValue }) => {
+    try {
+      const { data } = await axios.post("/api/admin/coupons", body, { headers: headers(getState) });
+      return data.coupon as CouponRow;
+    } catch (error) {
+      return rejectWithValue(formatAxiosError(error));
+    }
+  },
+);
+
+export const updateCoupon = createAsyncThunk(
+  "admin/updateCoupon",
+  async (input: { id: number; body: Record<string, unknown> }, { getState, rejectWithValue }) => {
+    try {
+      const { data } = await axios.patch(`/api/admin/coupons/${input.id}`, input.body, {
+        headers: headers(getState),
+      });
+      return data.coupon as CouponRow;
+    } catch (error) {
+      return rejectWithValue(formatAxiosError(error));
+    }
+  },
+);
+
+export const fetchBankTransferSettings = createAsyncThunk(
+  "admin/bankTransferSettings",
+  async (_, { getState, rejectWithValue }) => {
+    try {
+      const { data } = await axios.get("/api/admin/bank-transfer-settings", {
+        headers: headers(getState),
+      });
+      return data.settings as BankTransferSettings;
+    } catch (error) {
+      return rejectWithValue(formatAxiosError(error));
+    }
+  },
+);
+
+export const saveBankTransferSettings = createAsyncThunk(
+  "admin/saveBankTransferSettings",
+  async (body: BankTransferSettings, { getState, rejectWithValue }) => {
+    try {
+      const { data } = await axios.patch("/api/admin/bank-transfer-settings", body, {
+        headers: headers(getState),
+      });
+      return data.settings as BankTransferSettings;
+    } catch (error) {
+      return rejectWithValue(formatAxiosError(error));
+    }
+  },
+);
+
 export const fetchParticipants = createAsyncThunk(
   "admin/participants",
   async (query: AdminListQuery | undefined, { getState, rejectWithValue }) => {
@@ -434,6 +661,122 @@ export const inviteStaff = createAsyncThunk(
     try {
       const { data } = await axios.post("/api/admin/team", body, { headers: headers(getState) });
       return data.id as number;
+    } catch (error) {
+      return rejectWithValue(formatAxiosError(error));
+    }
+  },
+);
+
+export const fetchInstructors = createAsyncThunk(
+  "admin/instructors",
+  async (
+    query: (AdminListQuery & { activeOnly?: boolean }) | undefined,
+    { getState, rejectWithValue },
+  ) => {
+    try {
+      const { data } = await axios.get("/api/admin/instructors", {
+        headers: headers(getState),
+        params: {
+          ...listParams(query),
+          activeOnly: query?.activeOnly ? 1 : undefined,
+        },
+      });
+      return data as { instructors: InstructorRow[]; pagination: PaginationInfo };
+    } catch (error) {
+      return rejectWithValue(formatAxiosError(error));
+    }
+  },
+);
+
+export const inviteInstructor = createAsyncThunk(
+  "admin/inviteInstructor",
+  async (
+    body: { email: string; firstName: string; lastName?: string },
+    { getState, rejectWithValue },
+  ) => {
+    try {
+      const { data } = await axios.post("/api/admin/instructors", body, { headers: headers(getState) });
+      return data.id as number;
+    } catch (error) {
+      return rejectWithValue(formatAxiosError(error));
+    }
+  },
+);
+
+export const updateInstructor = createAsyncThunk(
+  "admin/updateInstructor",
+  async (input: { id: number; body: Record<string, unknown> }, { getState, rejectWithValue }) => {
+    try {
+      await axios.patch(`/api/admin/instructors/${input.id}`, input.body, { headers: headers(getState) });
+      return true;
+    } catch (error) {
+      return rejectWithValue(formatAxiosError(error));
+    }
+  },
+);
+
+export const fetchMyInstructorEditions = createAsyncThunk(
+  "admin/myInstructorEditions",
+  async (_, { getState, rejectWithValue }) => {
+    try {
+      const { data } = await axios.get("/api/instructor/editions", { headers: headers(getState) });
+      return data.editions as InstructorEdition[];
+    } catch (error) {
+      return rejectWithValue(formatAxiosError(error));
+    }
+  },
+);
+
+export const fetchMyEditionParticipants = createAsyncThunk(
+  "admin/myEditionParticipants",
+  async (editionId: number, { getState, rejectWithValue }) => {
+    try {
+      const { data } = await axios.get(`/api/instructor/editions/${editionId}/participants`, {
+        headers: headers(getState),
+      });
+      return data as { editionId: number; courseTitle: string; participants: InstructorParticipant[] };
+    } catch (error) {
+      return rejectWithValue(formatAxiosError(error));
+    }
+  },
+);
+
+export const fetchNotifications = createAsyncThunk(
+  "admin/notifications",
+  async (input: { unreadOnly?: boolean; limit?: number } | undefined, { getState, rejectWithValue }) => {
+    try {
+      const { data } = await axios.get("/api/admin/notifications", {
+        headers: headers(getState),
+        params: {
+          unreadOnly: input?.unreadOnly ? 1 : undefined,
+          limit: input?.limit || 20,
+        },
+      });
+      return data as { unreadCount: number; total: number; notifications: AdminNotification[] };
+    } catch (error) {
+      return rejectWithValue(formatAxiosError(error));
+    }
+  },
+);
+
+export const markNotificationRead = createAsyncThunk(
+  "admin/markNotificationRead",
+  async (id: number, { getState, rejectWithValue }) => {
+    try {
+      await axios.post(`/api/admin/notifications/${id}/read`, {}, { headers: headers(getState) });
+      return id;
+    } catch (error) {
+      return rejectWithValue(formatAxiosError(error));
+    }
+  },
+);
+
+export const markAllNotificationsRead = createAsyncThunk(
+  "admin/markAllNotificationsRead",
+  async (_, { getState, rejectWithValue }) => {
+    try {
+      await axios.post("/api/admin/notifications/read-all", {}, { headers: headers(getState) });
+      return true;
     } catch (error) {
       return rejectWithValue(formatAxiosError(error));
     }
@@ -672,6 +1015,94 @@ const adminSlice = createSlice({
         state.listLoading = false;
         state.error = String(action.payload || "");
       })
+      .addCase(fetchTransfers.pending, (state) => {
+        state.listLoading = true;
+        state.error = null;
+      })
+      .addCase(fetchTransfers.fulfilled, (state, action) => {
+        state.listLoading = false;
+        state.transfers = action.payload.transfers;
+        state.transfersPagination = action.payload.pagination;
+      })
+      .addCase(fetchTransfers.rejected, (state, action) => {
+        state.listLoading = false;
+        state.error = String(action.payload || "");
+      })
+      .addCase(fetchCoupons.pending, (state) => {
+        state.listLoading = true;
+        state.error = null;
+      })
+      .addCase(fetchCoupons.fulfilled, (state, action) => {
+        state.listLoading = false;
+        state.coupons = action.payload.coupons;
+        state.couponsPagination = action.payload.pagination;
+      })
+      .addCase(fetchCoupons.rejected, (state, action) => {
+        state.listLoading = false;
+        state.error = String(action.payload || "");
+      })
+      .addCase(createCoupon.pending, (state) => {
+        state.saving = true;
+        state.error = null;
+      })
+      .addCase(createCoupon.fulfilled, (state) => {
+        state.saving = false;
+      })
+      .addCase(createCoupon.rejected, (state, action) => {
+        state.saving = false;
+        state.error = String(action.payload || "");
+      })
+      .addCase(updateCoupon.pending, (state) => {
+        state.saving = true;
+        state.error = null;
+      })
+      .addCase(updateCoupon.fulfilled, (state) => {
+        state.saving = false;
+      })
+      .addCase(updateCoupon.rejected, (state, action) => {
+        state.saving = false;
+        state.error = String(action.payload || "");
+      })
+      .addCase(confirmTransfer.pending, (state) => {
+        state.saving = true;
+        state.error = null;
+      })
+      .addCase(confirmTransfer.fulfilled, (state) => {
+        state.saving = false;
+      })
+      .addCase(confirmTransfer.rejected, (state, action) => {
+        state.saving = false;
+        state.error = String(action.payload || "");
+      })
+      .addCase(rejectTransfer.pending, (state) => {
+        state.saving = true;
+        state.error = null;
+      })
+      .addCase(rejectTransfer.fulfilled, (state) => {
+        state.saving = false;
+      })
+      .addCase(rejectTransfer.rejected, (state, action) => {
+        state.saving = false;
+        state.error = String(action.payload || "");
+      })
+      .addCase(fetchBankTransferSettings.fulfilled, (state, action) => {
+        state.bankTransferSettings = action.payload;
+      })
+      .addCase(fetchBankTransferSettings.rejected, (state, action) => {
+        state.error = String(action.payload || "");
+      })
+      .addCase(saveBankTransferSettings.pending, (state) => {
+        state.saving = true;
+        state.error = null;
+      })
+      .addCase(saveBankTransferSettings.fulfilled, (state, action) => {
+        state.saving = false;
+        state.bankTransferSettings = action.payload;
+      })
+      .addCase(saveBankTransferSettings.rejected, (state, action) => {
+        state.saving = false;
+        state.error = String(action.payload || "");
+      })
       .addCase(fetchParticipants.pending, (state) => {
         state.listLoading = true;
         state.error = null;
@@ -755,6 +1186,64 @@ const adminSlice = createSlice({
       })
       .addCase(updateCatalogOption.rejected, (state, action) => {
         state.error = String(action.payload || "");
+      })
+      .addCase(fetchInstructors.pending, (state) => {
+        state.listLoading = true;
+        state.error = null;
+      })
+      .addCase(fetchInstructors.fulfilled, (state, action) => {
+        state.listLoading = false;
+        state.instructors = action.payload.instructors;
+        state.instructorsPagination = action.payload.pagination;
+      })
+      .addCase(fetchInstructors.rejected, (state, action) => {
+        state.listLoading = false;
+        state.error = String(action.payload || "");
+      })
+      .addCase(inviteInstructor.pending, (state) => {
+        state.saving = true;
+        state.error = null;
+      })
+      .addCase(inviteInstructor.fulfilled, (state) => {
+        state.saving = false;
+      })
+      .addCase(inviteInstructor.rejected, (state, action) => {
+        state.saving = false;
+        state.error = String(action.payload || "");
+      })
+      .addCase(updateInstructor.rejected, (state, action) => {
+        state.error = String(action.payload || "");
+      })
+      .addCase(fetchMyInstructorEditions.fulfilled, (state, action) => {
+        state.myEditions = action.payload;
+      })
+      .addCase(fetchMyInstructorEditions.rejected, (state, action) => {
+        state.error = String(action.payload || "");
+      })
+      .addCase(fetchMyEditionParticipants.fulfilled, (state, action) => {
+        state.myParticipants = action.payload.participants;
+        state.myParticipantsCourseTitle = action.payload.courseTitle;
+      })
+      .addCase(fetchMyEditionParticipants.rejected, (state, action) => {
+        state.error = String(action.payload || "");
+      })
+      .addCase(fetchNotifications.fulfilled, (state, action) => {
+        state.notifications = action.payload.notifications;
+        state.unreadNotifications = action.payload.unreadCount;
+      })
+      .addCase(markNotificationRead.fulfilled, (state, action) => {
+        const id = action.payload;
+        state.notifications = state.notifications.map((item) =>
+          item.id === id ? { ...item, readAt: item.readAt || new Date().toISOString() } : item,
+        );
+        state.unreadNotifications = Math.max(0, state.unreadNotifications - 1);
+      })
+      .addCase(markAllNotificationsRead.fulfilled, (state) => {
+        state.notifications = state.notifications.map((item) => ({
+          ...item,
+          readAt: item.readAt || new Date().toISOString(),
+        }));
+        state.unreadNotifications = 0;
       });
   },
 });
